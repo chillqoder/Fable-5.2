@@ -1,0 +1,56 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e3]:
+    - generic [ref=e4]: NODAL
+    - generic [ref=e5]: AI development studio
+  - navigation "Разделы сайта" [ref=e6]:
+    - button "Студия" [ref=e7] [cursor=pointer]
+    - button "Процесс" [ref=e8] [cursor=pointer]
+    - button "Услуги" [ref=e9] [cursor=pointer]
+    - button "Подход" [ref=e10] [cursor=pointer]
+    - button "Форматы" [ref=e11] [cursor=pointer]
+    - button "Контакт" [ref=e12] [cursor=pointer]
+  - complementary [ref=e13]:
+    - generic [ref=e14]: 055.0Hz
+    - generic [ref=e15]:
+      - generic [ref=e16]: mode 1·2
+      - generic "resonance lock" [ref=e17]
+    - button "звук выкл." [ref=e26] [cursor=pointer]
+  - main:
+    - region "Студия":
+      - paragraph [ref=e27]: Студия вайбкодинга · от идеи до запуска
+      - heading [level=2] [ref=e28]:
+        - text: Ваша идея.Наш код.
+        - emphasis [ref=e29]: Живой продукт.
+      - paragraph [ref=e30]: Создаём сайты, приложения и MVP с помощью AI. Вы приносите идею — мы проектируем, пишем код, тестируем и запускаем.
+      - generic [ref=e31]:
+        - button "Обсудить проект ↗" [ref=e32] [cursor=pointer]:
+          - text: Обсудить проект
+          - generic [ref=e33]: ↗
+        - button "Что мы делаем →" [ref=e34] [cursor=pointer]
+      - list:
+        - listitem:
+          - generic: Из шума — в форму
+          - text: "Так и с идеей: находим структуру, убираем лишнее, собираем продукт."
+  - navigation "Frequency dial" [ref=e35]:
+    - generic:
+      - generic [ref=e37]: "43"
+      - generic [ref=e58]: "70"
+      - generic [ref=e79]: "113"
+      - generic [ref=e100]: "183"
+      - generic [ref=e121]: "296"
+      - generic [ref=e142]: "480"
+      - generic [ref=e163]: "776"
+      - button "055Студия" [ref=e164] [cursor=pointer]
+      - button "089Процесс" [ref=e165] [cursor=pointer]
+      - button "144Услуги" [ref=e166] [cursor=pointer]
+      - button "233Подход" [ref=e167] [cursor=pointer]
+      - button "377Форматы" [ref=e168] [cursor=pointer]
+      - button "610Контакт" [ref=e169] [cursor=pointer]
+  - generic [ref=e170]:
+    - generic [ref=e171]: LIVE EXPERIMENT / 001
+    - generic [ref=e172]:
+      - button "Разобрать прибор" [ref=e173] [cursor=pointer]
+      - button "↗ Встряхнуть" [ref=e174] [cursor=pointer]
+      - button "Вернуть исходный ракурс" [ref=e175] [cursor=pointer]: ↺
+    - generic [ref=e176]: Потяните, чтобы вращать · загляните внутрь
+  - paragraph [ref=e177]: Скролл или ← → — сменить раздел

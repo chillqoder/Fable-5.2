@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>NODAL — студия сайтов, приложений и MVP</title>
+  <meta name="description" content="Студия вайбкодинга NODAL. Создаём сайты, приложения и MVP с помощью AI: от идеи и дизайна до разработки и запуска.">
+  <meta name="theme-color" content="#ECE6D6">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23FF4A1C'/%3E%3Cpath d='M0 11c8 0 8 10 16 10s8-10 16-10' fill='none' stroke='%2315130F' stroke-width='4'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,100..900,0..100,0..1;1,9..144,100..900,0..100,0..1&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./src/style.css">
+</head>
+<body>
+  <canvas id="plate" aria-hidden="true"></canvas>
+  <svg id="leaders" aria-hidden="true"></svg>
+
+  <header class="hud tl">
+    <span class="mark">NODAL</span>
+    <span class="sub">AI development studio</span>
+  </header>
+
+  <nav id="quick-nav" aria-label="Разделы сайта"></nav>
+  <aside class="hud tr">
+    <div class="hz"><span id="hz">055.0</span><small>Hz</small></div>
+    <div class="meta">
+      <span id="mode">mode 1·2</span>
+      <span id="lock" aria-label="resonance lock"></span>
+    </div>
+    <button id="sound" type="button" aria-pressed="false">звук выкл.</button>
+  </aside>
+
+  <main id="stations"></main>
+
+  <nav id="dial" aria-label="Frequency dial">
+    <div class="strip" id="strip"></div>
+    <div class="needle" aria-hidden="true"></div>
+  </nav>
+
+  <div class="experiment"><span class="experiment-label">LIVE EXPERIMENT / 001</span><div class="instrument-controls"><button id="explode" type="button" aria-pressed="false">Разобрать прибор</button><button id="shake" type="button">↗ Встряхнуть</button><button id="reset-view" type="button" aria-label="Вернуть исходный ракурс">↺</button></div><span class="experiment-note">Потяните, чтобы вращать · загляните внутрь</span></div>
+  <p class="hint" id="hint">Скролл или ← → — сменить раздел</p>
+
+  <noscript>Nodal is a AI development studio. This site needs JavaScript to vibrate.</noscript>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e3]:
+    - generic [ref=e4]: NODAL
+    - generic [ref=e5]: vibe-code studio
+  - complementary [ref=e6]:
+    - generic [ref=e7]: 055.0Hz
+    - generic [ref=e8]:
+      - generic [ref=e9]: mode 1·2
+      - generic "resonance lock" [ref=e10]
+    - button "sound off" [ref=e19] [cursor=pointer]
+  - main:
+    - region "HUM":
+      - paragraph [ref=e20]: Nodal — a vibe-code studio
+      - heading [level=2] [ref=e21]:
+        - text: Software,
+        - emphasis [ref=e22]: tuned
+        - text: into existence.
+      - paragraph [ref=e23]: We don’t start with tickets. We start with a feeling, say it out loud to machines, and keep tuning until the noise settles into a product.
+      - list:
+        - listitem:
+          - generic: This is sand
+          - text: Tens of thousands of grains, simulated one by one.
+        - listitem:
+          - generic: This is a plate
+          - text: Vibrating at 55 Hz. Grains rest where it stays still.
+        - listitem:
+          - generic: This is the site
+          - text: No pages. Turn the dial to the next resonance.
+  - navigation "Frequency dial" [ref=e24]:
+    - generic:
+      - generic [ref=e26]: "43"
+      - generic [ref=e47]: "70"
+      - generic [ref=e68]: "113"
+      - generic [ref=e89]: "183"
+      - generic [ref=e110]: "296"
+      - generic [ref=e131]: "480"
+      - generic [ref=e152]: "776"
+      - button "055HUM" [ref=e153] [cursor=pointer]
+      - button "089TUNE" [ref=e154] [cursor=pointer]
+      - button "144WORK" [ref=e155] [cursor=pointer]
+      - button "233TASTE" [ref=e156] [cursor=pointer]
+      - button "377TEMPO" [ref=e157] [cursor=pointer]
+      - button "610SIGNAL" [ref=e158] [cursor=pointer]
+  - paragraph [ref=e159]: scroll · drag · ← → to tune

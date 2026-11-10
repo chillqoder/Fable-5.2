@@ -1,0 +1,1428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bloom</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #020506; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #020506; }
+  #stage canvas { display: block; }
+  #msg { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 32px;
+         box-sizing: border-box; text-align: center; color: #d9c7cf; background: #020506;
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #msg[hidden] { display: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="stage"></div>
+<div id="msg" hidden></div>
+<script type="module">
+/* =====================================================================
+   Bloom — a procedural growing flower.
+   Everything on screen is a pure function of one normalized timeline
+   value t in [0, 1]:  updateGrowth(t).
+   ===================================================================== */
+
+const LOOP = 20;                       // seconds per loop
+const D2R = Math.PI / 180;
+
+/* ---------- small math helpers ---------- */
+const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const smoother = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * t * (t * (t * 6 - 15) + 10); };
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(x, y) {
+  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, period) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  let x0 = xi, x1 = xi + 1, y0 = yi, y1 = yi + 1;
+  if (period) { x0 = ((x0 % period) + period) % period; x1 = ((x1 % period) + period) % period;
+                y0 = ((y0 % period) + period) % period; y1 = ((y1 % period) + period) % period; }
+  const a = hash2(x0, y0), b = hash2(x1, y0), c = hash2(x0, y1), d = hash2(x1, y1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct = 4, period = 0) {
+  let s = 0, a = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { s += a * vnoise(x * f, y * f, period ? period * f : 0); f *= 2; a *= 0.5; }
+  return s;
+}
+
+/* Monotone cubic keyframe track: smooth, no overshoot, flat outside the keys. */
+function track(keys) {
+  const n = keys.length, xs = keys.map(k => k[0]), ys = keys.map(k => k[1]);
+  const d = new Array(n - 1), m = new Array(n);
+  for (let i = 0; i < n - 1; i++) d[i] = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]);
+  m[0] = 0; m[n - 1] = 0;
+  for (let i = 1; i < n - 1; i++) m[i] = (d[i - 1] * d[i] <= 0) ? 0 : (d[i - 1] + d[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (d[i] === 0) { m[i] = 0; m[i + 1] = 0; }
+    else {
+      const a = m[i] / d[i], b = m[i + 1] / d[i], s = a * a + b * b;
+      if (s > 9) { const tau = 3 / Math.sqrt(s); m[i] = tau * a * d[i]; m[i + 1] = tau * b * d[i]; }
+    }
+  }
+  return (x) => {
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    let i = 0; while (x > xs[i + 1]) i++;
+    const h = xs[i + 1] - xs[i], t = (x - xs[i]) / h, t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h * m[i]
+         + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h * m[i + 1];
+  };
+}
+
+/* Ease used for anything that "opens": slow start, slight overshoot, settle. */
+function openCurve(x) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const sb = Math.sin(Math.PI * clamp01((x - 0.55) / 0.45));
+  return smoother(0, 0.8, x) + 0.055 * sb * sb;
+}
+
+/* ---------- loop clock ----------
+   s  : loop time in seconds, 0..20
+   G  : growth clock. Equals s while the plant grows and holds; during the
+        fully black part of the seam it rewinds, so every quantity derived
+        from it is continuous across t = 1 -> t = 0.                        */
+const T_FADE = 19.0, T_BLACK0 = 19.45, T_BLACK1 = 19.6, PRE = LOOP - T_BLACK1;
+function growthClock(s) {
+  if (s < T_BLACK0) return s;
+  if (s < T_BLACK1) return lerp(T_BLACK0, -PRE, (s - T_BLACK0) / (T_BLACK1 - T_BLACK0));
+  return s - LOOP;
+}
+function veilAt(s) {
+  if (s >= T_BLACK1) return smooth(0, 1.2, s - T_BLACK1);
+  if (s < 1.2 - PRE) return smooth(0, 1.2, s + PRE);
+  if (s < T_FADE) return 1;
+  return 1 - smooth(T_FADE, T_BLACK0, s);
+}
+
+function showMessage(text) {
+  const m = document.getElementById('msg');
+  m.textContent = text; m.hidden = false;
+}
+
+async function main() {
+  /* ---------- capability check ---------- */
+  let hasGL = false;
+  try {
+    const probe = document.createElement('canvas');
+    const gl = probe.getContext('webgl2');
+    hasGL = !!gl;
+    if (gl) { const lose = gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext(); }
+  } catch (e) { hasGL = false; }
+  if (!hasGL) { showMessage('This animation needs WebGL 2, which is not available in this browser.'); return; }
+
+  let THREE, RoomEnvironment, EffectComposer, RenderPass, UnrealBloomPass, ShaderPass, OutputPass;
+  try {
+    const mods = await Promise.all([
+      import('three'),
+      import('three/addons/environments/RoomEnvironment.js'),
+      import('three/addons/postprocessing/EffectComposer.js'),
+      import('three/addons/postprocessing/RenderPass.js'),
+      import('three/addons/postprocessing/UnrealBloomPass.js'),
+      import('three/addons/postprocessing/ShaderPass.js'),
+      import('three/addons/postprocessing/OutputPass.js'),
+    ]);
+    THREE = mods[0];
+    RoomEnvironment = mods[1].RoomEnvironment;
+    EffectComposer = mods[2].EffectComposer;
+    RenderPass = mods[3].RenderPass;
+    UnrealBloomPass = mods[4].UnrealBloomPass;
+    ShaderPass = mods[5].ShaderPass;
+    OutputPass = mods[6].OutputPass;
+  } catch (e) {
+    showMessage('The 3D engine could not be loaded. Check the connection and reload the page.');
+    return;
+  }
+
+  const V3 = THREE.Vector3;
+  const rand = mulberry32(90210);
+  const rr = (a, b) => a + (b - a) * rand();
+
+  /* =================================================================
+     Stage 1 — renderer, frame, camera
+     ================================================================= */
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  } catch (e) {
+    showMessage('WebGL could not be started on this device.');
+    return;
+  }
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.setClearColor(0x020506, 1);
+  document.getElementById('stage').appendChild(renderer.domElement);
+  const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
+
+  const scene = new THREE.Scene();
+  let camera;
+  const BASE_FOV = 32;                 // vertical field of view of the 9:16 design frame
+  const TIP_SCREEN_Y = 0.64;           // growing tip sits in the upper-middle third
+  let tipPitchK = 0;
+
+  /* Uniforms shared between materials. */
+  const shared = {
+    uRes: { value: new THREE.Vector2(1, 1) },
+    uAspect: { value: 9 / 16 },
+    uBgLevel: { value: 1 },
+    uBackDir: { value: new V3(0, 1, 0) },      // view-space direction towards the key light
+    uBackColor: { value: new THREE.Color(1, 1, 1) },
+    uGreen: { value: 0 },                      // how green the young petals still are
+  };
+
+  function setupCamera() {
+    camera = new THREE.PerspectiveCamera(BASE_FOV, 9 / 16, 0.05, 80);
+    camera.position.set(-0.9, 0.3, 1.2);
+  }
+
+  /* ---------- procedural canvas textures ---------- */
+  function canvasTexture(w, h, draw, { srgb = true, repeat = false } = {}) {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    draw(c.getContext('2d'), w, h);
+    const t = new THREE.CanvasTexture(c);
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    if (repeat) { t.wrapS = THREE.RepeatWrapping; t.wrapT = THREE.RepeatWrapping; }
+    t.anisotropy = Math.min(8, MAX_ANISO);
+    return t;
+  }
+
+  // Petal: base (canvas bottom) deep magenta-rose -> pale blush tip, fine darker veins, lighter edge.
+  function drawPetal(g, w, h, bump) {
+    const R = mulberry32(7);
+    if (bump) { g.fillStyle = '#808080'; g.fillRect(0, 0, w, h); }
+    else {
+      const gr = g.createLinearGradient(0, h, 0, 0);
+      gr.addColorStop(0.00, '#a52a61'); gr.addColorStop(0.16, '#b8326a'); gr.addColorStop(0.46, '#d7628f');
+      gr.addColorStop(0.76, '#f3a9c2'); gr.addColorStop(1.00, '#ffd6e2');
+      g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    }
+    const N = 56;
+    for (let i = 0; i < N; i++) {
+      const x0 = (i + 0.5) / N * w + (R() - 0.5) * 4, amp = 1 + R() * 3.5, ph = R() * 6.283, fr = 2 + R() * 3;
+      const lw = 0.6 + R() * 1.1, strong = R() < 0.22 ? 1.6 : 1;
+      const lg = g.createLinearGradient(0, h, 0, 0);
+      if (bump) { lg.addColorStop(0, 'rgba(40,40,40,0.55)'); lg.addColorStop(1, 'rgba(60,60,60,0.12)'); }
+      else {
+        lg.addColorStop(0.0, `rgba(118,14,62,${0.36 * strong})`);
+        lg.addColorStop(0.6, `rgba(150,40,92,${0.17 * strong})`);
+        lg.addColorStop(1.0, 'rgba(190,90,130,0.03)');
+      }
+      g.strokeStyle = lg; g.lineWidth = lw * strong; g.beginPath();
+      for (let y = h; y >= -8; y -= 12) {
+        const x = x0 + Math.sin(y / h * fr + ph) * amp;
+        if (y === h) g.moveTo(x, y); else g.lineTo(x, y);
+      }
+      g.stroke();
+    }
+    if (!bump) {
+      const eg = g.createLinearGradient(0, 0, w, 0);
+      eg.addColorStop(0.00, 'rgba(255,238,244,0.55)'); eg.addColorStop(0.20, 'rgba(255,238,244,0)');
+      eg.addColorStop(0.80, 'rgba(255,238,244,0)');    eg.addColorStop(1.00, 'rgba(255,238,244,0.55)');
+      g.fillStyle = eg; g.fillRect(0, 0, w, h);
+      const tg = g.createLinearGradient(0, h * 0.2, 0, 0);
+      tg.addColorStop(0, 'rgba(255,240,245,0)'); tg.addColorStop(1, 'rgba(255,240,245,0.4)');
+      g.fillStyle = tg; g.fillRect(0, 0, w, h * 0.2);
+    }
+  }
+
+  // Leaf: midrib, branching side veins, soft mottling. Canvas bottom = leaf base.
+  function drawLeaf(g, w, h, bump) {
+    const R = mulberry32(11), cx = w / 2;
+    if (bump) { g.fillStyle = '#8a8a8a'; g.fillRect(0, 0, w, h); }
+    else {
+      const gr = g.createLinearGradient(0, h, 0, 0);
+      gr.addColorStop(0, '#356f2a'); gr.addColorStop(0.55, '#4a8a36'); gr.addColorStop(1, '#5d9a40');
+      g.fillStyle = gr; g.fillRect(0, 0, w, h);
+      for (let i = 0; i < 1400; i++) {
+        g.fillStyle = R() < 0.5 ? 'rgba(20,60,18,0.10)' : 'rgba(150,200,100,0.07)';
+        const s = 1 + R() * 5; g.fillRect(R() * w, R() * h, s, s * (1 + R()));
+      }
+      const eg = g.createLinearGradient(0, 0, w, 0);
+      eg.addColorStop(0, 'rgba(18,52,16,0.35)'); eg.addColorStop(0.22, 'rgba(18,52,16,0)');
+      eg.addColorStop(0.78, 'rgba(18,52,16,0)'); eg.addColorStop(1, 'rgba(18,52,16,0.35)');
+      g.fillStyle = eg; g.fillRect(0, 0, w, h);
+    }
+    const veinCol = bump ? 'rgba(30,30,30,0.7)' : 'rgba(168,206,120,0.42)';
+    const fineCol = bump ? 'rgba(50,50,50,0.3)' : 'rgba(160,200,116,0.16)';
+    const n = 12;
+    g.lineCap = 'round';
+    for (let k = 0; k < n; k++) {
+      const y0 = h * (0.95 - 0.84 * k / n);
+      for (const side of [-1, 1]) {
+        g.strokeStyle = veinCol; g.lineWidth = 2.4 - k * 0.11;
+        g.beginPath(); g.moveTo(cx, y0);
+        g.quadraticCurveTo(cx + side * w * 0.26, y0 - h * 0.06, cx + side * w * 0.52, y0 - h * 0.17);
+        g.stroke();
+        g.strokeStyle = fineCol; g.lineWidth = 1;
+        for (let q = 1; q <= 3; q++) {
+          const f = q / 4, bx = cx + side * w * 0.5 * f, by = y0 - h * (0.045 * f + 0.125 * f * f);
+          g.beginPath(); g.moveTo(bx, by); g.lineTo(bx + side * w * 0.07, by - h * 0.055 + (R() - 0.5) * 6); g.stroke();
+          g.beginPath(); g.moveTo(bx, by); g.lineTo(bx - side * w * 0.03, by + h * 0.035 + (R() - 0.5) * 6); g.stroke();
+        }
+      }
+    }
+    g.fillStyle = bump ? 'rgba(25,25,25,0.85)' : 'rgba(186,218,138,0.7)';
+    g.beginPath(); g.moveTo(cx - 4.5, h); g.lineTo(cx - 0.8, 0); g.lineTo(cx + 0.8, 0); g.lineTo(cx + 4.5, h); g.closePath(); g.fill();
+  }
+
+  function drawStem(g, w, h) {
+    const R = mulberry32(23);
+    g.fillStyle = '#e9e9e9'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 46; i++) {
+      const x = R() * w, v = R() < 0.5 ? 255 : 150;
+      g.strokeStyle = `rgba(${v},${v},${v},${0.05 + R() * 0.09})`; g.lineWidth = 0.6 + R() * 1.6;
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x + (R() - 0.5) * 3, h); g.stroke();
+    }
+    for (let i = 0; i < 160; i++) { g.fillStyle = `rgba(90,90,90,${R() * 0.14})`; g.fillRect(R() * w, R() * h, 1.2, 2 + R() * 6); }
+  }
+
+  // Cotyledon: plain fleshy surface, only a faint midrib (the material colour does the tinting).
+  function drawCotyledon(g, w, h) {
+    const R = mulberry32(41);
+    const gr = g.createLinearGradient(0, h, 0, 0);
+    gr.addColorStop(0, '#d2d2c8'); gr.addColorStop(1, '#f4f4ec');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 300; i++) { g.fillStyle = `rgba(90,110,70,${R() * 0.06})`; const s = 2 + R() * 6; g.fillRect(R() * w, R() * h, s, s); }
+    const mg = g.createLinearGradient(0, 0, w, 0);
+    mg.addColorStop(0.40, 'rgba(255,255,240,0)'); mg.addColorStop(0.50, 'rgba(255,255,240,0.5)'); mg.addColorStop(0.60, 'rgba(255,255,240,0)');
+    g.fillStyle = mg; g.fillRect(0, 0, w, h);
+    const eg = g.createLinearGradient(0, 0, w, 0);
+    eg.addColorStop(0, 'rgba(60,80,40,0.25)'); eg.addColorStop(0.2, 'rgba(60,80,40,0)'); eg.addColorStop(0.8, 'rgba(60,80,40,0)'); eg.addColorStop(1, 'rgba(60,80,40,0.25)');
+    g.fillStyle = eg; g.fillRect(0, 0, w, h);
+  }
+
+  function drawSoil(g, w, h) {
+    const img = g.createImageData(w, h), d = img.data;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const n = fbm(x / w * 6, y / h * 6, 4, 6), f = fbm(x / w * 28, y / h * 28, 3, 28);
+      let v = 0.60 + 0.45 * (n - 0.47) + 0.6 * (f - 0.44) + (hash2(x, y) - 0.5) * 0.2;
+      v = clamp01(v) * 255;
+      const o = (y * w + x) * 4; d[o] = v; d[o + 1] = v; d[o + 2] = v; d[o + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+  }
+
+  function drawSeed(g, w, h) {
+    const R = mulberry32(31);
+    const gr = g.createLinearGradient(0, 0, w, 0);
+    gr.addColorStop(0.00, '#2e1a0c'); gr.addColorStop(0.035, '#5b3a1f'); gr.addColorStop(0.30, '#86592f');
+    gr.addColorStop(0.55, '#7a4f2a'); gr.addColorStop(0.965, '#5b3a1f'); gr.addColorStop(1.00, '#2e1a0c');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 70; i++) {
+      const y = R() * h;
+      g.strokeStyle = R() < 0.5 ? `rgba(40,22,8,${0.05 + R() * 0.12})` : `rgba(190,140,80,${0.04 + R() * 0.08})`;
+      g.lineWidth = 0.6 + R() * 1.4; g.beginPath(); g.moveTo(0, y);
+      g.bezierCurveTo(w * 0.3, y + (R() - 0.5) * 10, w * 0.7, y + (R() - 0.5) * 10, w, y + (R() - 0.5) * 6); g.stroke();
+    }
+    for (let i = 0; i < 260; i++) { g.fillStyle = `rgba(30,16,6,${R() * 0.22})`; g.fillRect(R() * w, R() * h, 1 + R() * 2, 1 + R() * 2); }
+  }
+
+  const TEX = {
+    petal: canvasTexture(256, 512, (g, w, h) => drawPetal(g, w, h, false)),
+    petalBump: canvasTexture(256, 512, (g, w, h) => drawPetal(g, w, h, true), { srgb: false }),
+    leaf: canvasTexture(256, 512, (g, w, h) => drawLeaf(g, w, h, false)),
+    leafBump: canvasTexture(256, 512, (g, w, h) => drawLeaf(g, w, h, true), { srgb: false }),
+    cot: canvasTexture(128, 256, drawCotyledon),
+    stem: canvasTexture(64, 256, drawStem, { repeat: true }),
+    soil: canvasTexture(512, 512, drawSoil, { srgb: false, repeat: true }),
+    seed: canvasTexture(256, 128, drawSeed),
+  };
+
+  /* ---------- background gradient (shared GLSL, also used to melt the soil edge into it) ---------- */
+  const BG_GLSL = /* glsl */`
+    uniform float uBgLevel;
+    uniform float uAspect;
+    vec3 bgColor(vec2 uv) {
+      float y = uv.y;
+      vec3 c0 = vec3(0.0010, 0.0055, 0.0065);   // deep teal-black
+      vec3 c1 = vec3(0.0035, 0.0150, 0.0190);
+      vec3 c2 = vec3(0.0260, 0.0200, 0.0520);
+      vec3 c3 = vec3(0.0950, 0.0460, 0.0900);   // warm dusk violet
+      vec3 c = mix(c0, c1, smoothstep(0.0, 0.45, y));
+      c = mix(c, c2, smoothstep(0.38, 0.78, y));
+      c = mix(c, c3, smoothstep(0.66, 1.08, y));
+      vec2 p = (uv - vec2(0.30, 0.80)) * vec2(uAspect, 1.0);
+      c += vec3(0.130, 0.058, 0.050) * exp(-dot(p, p) * 5.0) * 0.55;   // dusk glow on the key-light side
+      return c * uBgLevel;
+    }`;
+
+  function createBackground() {
+    const mat = new THREE.ShaderMaterial({
+      uniforms: { uBgLevel: shared.uBgLevel, uAspect: shared.uAspect },
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 1.0, 1.0); }`,
+      fragmentShader: `varying vec2 vUv; ${BG_GLSL} void main(){ gl_FragColor = vec4(bgColor(vUv), 1.0); }`,
+      depthTest: false, depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+    mesh.frustumCulled = false; mesh.renderOrder = -100;
+    scene.add(mesh);
+    return mesh;
+  }
+
+  /* ---------- translucent foliage material ----------
+     MeshPhysicalMaterial plus a thin-surface backlight term: light arriving
+     on the far side of the leaf/petal glows through, strongest near the edge. */
+  function foliageMaterial(params, { transl = 1, tint = [1, 1, 1], edge = 0.9, petal = false } = {}) {
+    const mat = new THREE.MeshPhysicalMaterial(params);
+    mat.onBeforeCompile = (sh) => {
+      sh.uniforms.uBackDir = shared.uBackDir;
+      sh.uniforms.uBackColor = shared.uBackColor;
+      sh.uniforms.uGreen = shared.uGreen;
+      sh.uniforms.uTransl = { value: transl };
+      sh.uniforms.uTint = { value: new V3(tint[0], tint[1], tint[2]) };
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', `#include <common>
+          uniform vec3 uBackDir; uniform vec3 uBackColor; uniform vec3 uTint;
+          uniform float uTransl; uniform float uGreen;`)
+        .replace('#include <map_fragment>', `#include <map_fragment>
+          ${petal ? `{
+            float gAmt = clamp(uGreen * 1.7 - vMapUv.y * 0.95, 0.0, 1.0);
+            float lum = dot(diffuseColor.rgb, vec3(0.3, 0.6, 0.1));
+            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.20, 0.40, 0.10) * (0.55 + lum * 1.3), gAmt);
+          }` : ''}`)
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+          {
+            float bl = saturate(dot(-normal, uBackDir) * 0.8 + 0.2);
+            bl *= bl;
+            float ex = abs(vMapUv.x * 2.0 - 1.0);
+            float edgeK = smoothstep(0.4, 1.0, max(ex, vMapUv.y * 0.9));
+            totalEmissiveRadiance += diffuseColor.rgb * uTint * uBackColor * bl * uTransl * (0.55 + ${edge.toFixed(2)} * edgeK);
+          }`);
+    };
+    mat.customProgramCacheKey = () => 'foliage' + (petal ? 'P' : 'L') + edge.toFixed(2);
+    return mat;
+  }
+
+  /* =================================================================
+     Soil
+     ================================================================= */
+  function soilHeight(x, z) {
+    const r2 = x * x + z * z, r = Math.sqrt(r2);
+    const mound = 0.22 * (Math.exp(-r2 / 1.3) - 1);
+    const rough = (fbm(x * 2.3 + 11.7, z * 2.3 - 4.2, 4) - 0.47) * 0.10 * smooth(0.08, 0.5, r);
+    const fine = (fbm(x * 9 + 3.1, z * 9 + 8.4, 3) - 0.44) * 0.02 * smooth(0.05, 0.25, r);
+    return mound + rough + fine;
+  }
+
+  const soil = {};
+  function createSoil() {
+    /* ground disc: polar grid, denser at the centre */
+    const NR = 100, NS = 180, RMAX = 4.6;
+    const vc = (NR + 1) * (NS + 1);
+    const pos = new Float32Array(vc * 3), col = new Float32Array(vc * 3), uv = new Float32Array(vc * 2), damp = new Float32Array(vc);
+    const base = new THREE.Color('#2b1d14'), c = new THREE.Color();
+    let p = 0;
+    for (let i = 0; i <= NR; i++) {
+      const r = RMAX * Math.pow(i / NR, 1.6);
+      for (let k = 0; k <= NS; k++, p++) {
+        const th = k / NS * Math.PI * 2, x = r * Math.cos(th), z = r * Math.sin(th);
+        pos[p * 3] = x; pos[p * 3 + 1] = soilHeight(x, z); pos[p * 3 + 2] = z;
+        const wet = smooth(0.50, 0.60, fbm(x * 1.25 + 40.3, z * 1.25 + 17.9, 3));   // a few darker damp spots
+        const tone = 0.85 + 0.9 * fbm(x * 5.1 + 2.2, z * 5.1 + 9.7, 3);
+        c.copy(base).multiplyScalar(tone * lerp(0.92, 0.42, wet));
+        col[p * 3] = c.r; col[p * 3 + 1] = c.g; col[p * 3 + 2] = c.b;
+        uv[p * 2] = x * 2.6; uv[p * 2 + 1] = z * 2.6;
+        damp[p] = wet;
+      }
+    }
+    const idx = [];
+    for (let i = 0; i < NR; i++) for (let k = 0; k < NS; k++) {
+      const a = i * (NS + 1) + k, b = a + NS + 1;
+      idx.push(a, a + 1, b, a + 1, b + 1, b);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    geo.setAttribute('aDamp', new THREE.BufferAttribute(damp, 1));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true, map: TEX.soil, bumpMap: TEX.soil, bumpScale: 1.6, roughness: 1, metalness: 0,
+    });
+    mat.onBeforeCompile = (sh) => {
+      sh.uniforms.uRes = shared.uRes; sh.uniforms.uBgLevel = shared.uBgLevel; sh.uniforms.uAspect = shared.uAspect;
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aDamp; varying float vFade; varying float vDamp;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFade = smoothstep(1.25, 3.7, length(transformed.xz)); vDamp = aDamp;');
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', `#include <common>\nvarying float vFade; varying float vDamp; uniform vec2 uRes;\n${BG_GLSL}`)
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(1.0, 0.84, vDamp);')
+        .replace('#include <dithering_fragment>', `#include <dithering_fragment>
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, bgColor(gl_FragCoord.xy / uRes), vFade);`);
+    };
+    mat.customProgramCacheKey = () => 'soil-fade';
+    const ground = new THREE.Mesh(geo, mat);
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    /* crumbs: instanced angular chunks, densest around the seed */
+    const crumbGeo = new THREE.SphereGeometry(1, 9, 7);
+    { const a = crumbGeo.attributes.position;
+      for (let i = 0; i < a.count; i++) {
+        const x = a.getX(i), y = a.getY(i), z = a.getZ(i);
+        const k = 0.62 + 0.8 * fbm(x * 1.9 + 7.3, y * 1.9 + z * 2.3 + 1.7, 3);
+        a.setXYZ(i, x * k, y * k, z * k);
+      }
+      crumbGeo.computeVertexNormals(); }
+    const CRUMBS = 1700;
+    const crumbMat = new THREE.MeshStandardMaterial({ roughness: 1, metalness: 0 });
+    const crumbs = new THREE.InstancedMesh(crumbGeo, crumbMat, CRUMBS);
+    crumbs.castShadow = true; crumbs.receiveShadow = true;
+    const dummy = new THREE.Object3D(), near = [];
+    const cA = new THREE.Color('#231710'), cB = new THREE.Color('#5a4030');
+    for (let i = 0; i < CRUMBS; i++) {
+      const g = Math.abs(rand() + rand() + rand() - 1.5) / 1.5;
+      const r = 0.07 + g * 1.5, th = rand() * Math.PI * 2;
+      const x = r * Math.cos(th) - (r < 0.3 ? 0.03 : 0), z = r * Math.sin(th);
+      const s = (0.003 + Math.pow(rand(), 3.0) * 0.011) * (1 + 2.4 * smooth(0.25, 1.3, r));
+      dummy.position.set(x, soilHeight(x, z) + s * rr(0.1, 0.55), z);
+      dummy.rotation.set(rand() * 6.283, rand() * 6.283, rand() * 6.283);
+      dummy.scale.set(s * rr(0.8, 1.3), s * rr(0.55, 1.0), s * rr(0.8, 1.3));
+      dummy.updateMatrix(); crumbs.setMatrixAt(i, dummy.matrix);
+      c.lerpColors(cA, cB, rand() * rand()).multiplyScalar(rr(0.8, 1.7)); crumbs.setColorAt(i, c);
+      // crumbs close to where the sprout breaks through get nudged aside
+      const ex = x + 0.07, er = Math.hypot(ex, z);
+      if (er < 0.27) {
+        const wgt = Math.pow(1 - er / 0.27, 1.3);
+        near.push({ i, pos: dummy.position.clone(), quat: dummy.quaternion.clone(), scale: dummy.scale.clone(),
+                    dx: ex / (er + 1e-4), dz: z / (er + 1e-4), w: wgt, spin: rr(-1, 1), late: rr(0, 0.35) });
+      }
+    }
+    crumbs.instanceColor.needsUpdate = true;
+    scene.add(crumbs);
+
+    /* a few pebbles */
+    const pebGeo = new THREE.SphereGeometry(1, 18, 12);
+    { const a = pebGeo.attributes.position;
+      for (let i = 0; i < a.count; i++) {
+        const x = a.getX(i), y = a.getY(i), z = a.getZ(i);
+        const k = 0.86 + 0.3 * fbm(x * 1.4 + 5, y * 1.4 + z * 1.7 + 3, 3);
+        a.setXYZ(i, x * k, y * k, z * k);
+      }
+      pebGeo.computeVertexNormals(); }
+    const pebDefs = [[0.42, 152, 0.05], [0.60, -112, 0.068], [0.80, 98, 0.058], [0.98, -150, 0.085],
+                     [0.52, 74, 0.034], [1.12, 138, 0.075], [0.72, -62, 0.044], [1.28, 22, 0.066]];
+    const pebMat = new THREE.MeshStandardMaterial({ roughness: 0.62, metalness: 0 });
+    const pebbles = new THREE.InstancedMesh(pebGeo, pebMat, pebDefs.length);
+    pebbles.castShadow = true; pebbles.receiveShadow = true;
+    const pA = new THREE.Color('#2f2a26'), pB = new THREE.Color('#544a40');
+    pebDefs.forEach((d, i) => {
+      const x = d[0] * Math.sin(d[1] * D2R), z = d[0] * Math.cos(d[1] * D2R), s = d[2];
+      dummy.position.set(x, soilHeight(x, z) + s * 0.22, z);
+      dummy.rotation.set(rr(-0.3, 0.3), rand() * 6.283, rr(-0.3, 0.3));
+      dummy.scale.set(s * rr(0.9, 1.25), s * rr(0.55, 0.7), s * rr(0.85, 1.1));
+      dummy.updateMatrix(); pebbles.setMatrixAt(i, dummy.matrix);
+      c.lerpColors(pA, pB, rand()); pebbles.setColorAt(i, c);
+    });
+    pebbles.instanceColor.needsUpdate = true;
+    scene.add(pebbles);
+
+    soil.crumbs = crumbs; soil.near = near; soil.lastPush = -1;
+  }
+
+  /* =================================================================
+     Swept tube that can be re-laid every frame (stem, root)
+     ================================================================= */
+  class GrowTube {
+    constructor(rings, sides, material) {
+      this.rings = rings; this.sides = sides;
+      const vc = (rings + 1) * (sides + 1);
+      this.pos = new Float32Array(vc * 3); this.nrm = new Float32Array(vc * 3); this.uv = new Float32Array(vc * 2);
+      this.cP = new Float32Array((rings + 1) * 3); this.cT = new Float32Array((rings + 1) * 3);
+      this.cos = new Float32Array(sides + 1); this.sin = new Float32Array(sides + 1);
+      for (let k = 0; k <= sides; k++) { this.cos[k] = Math.cos(k / sides * Math.PI * 2); this.sin[k] = Math.sin(k / sides * Math.PI * 2); }
+      const idx = [];
+      for (let i = 0; i < rings; i++) for (let k = 0; k < sides; k++) {
+        const a = i * (sides + 1) + k, b = a + sides + 1;
+        idx.push(a, a + 1, b, a + 1, b + 1, b);
+      }
+      const geo = new THREE.BufferGeometry();
+      this.aPos = new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage);
+      this.aNrm = new THREE.BufferAttribute(this.nrm, 3).setUsage(THREE.DynamicDrawUsage);
+      this.aUv = new THREE.BufferAttribute(this.uv, 2).setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute('position', this.aPos); geo.setAttribute('normal', this.aNrm); geo.setAttribute('uv', this.aUv);
+      geo.setIndex(idx);
+      this.mesh = new THREE.Mesh(geo, material);
+      this.mesh.frustumCulled = false; this.mesh.castShadow = true; this.mesh.receiveShadow = true;
+      this.nx = 1; this.ny = 0; this.nz = 0;
+    }
+    start(nx, ny, nz) { this.nx = nx; this.ny = ny; this.nz = nz; }
+    // one cross-section: centre, unit tangent, radius, v texture coord, cap blend (sin, cos)
+    setRing(i, px, py, pz, tx, ty, tz, r, vc, capS, capC) {
+      let nx = this.nx, ny = this.ny, nz = this.nz;              // parallel-transported normal
+      const d = nx * tx + ny * ty + nz * tz; nx -= d * tx; ny -= d * ty; nz -= d * tz;
+      let l = Math.hypot(nx, ny, nz);
+      if (l < 1e-6) { nx = ty; ny = -tx; nz = 0; l = Math.hypot(nx, ny, nz) || 1; }
+      nx /= l; ny /= l; nz /= l; this.nx = nx; this.ny = ny; this.nz = nz;
+      const bx = ty * nz - tz * ny, by = tz * nx - tx * nz, bz = tx * ny - ty * nx;
+      const S = this.sides, pos = this.pos, nrm = this.nrm, uv = this.uv;
+      let o = i * (S + 1) * 3, q = i * (S + 1) * 2;
+      for (let k = 0; k <= S; k++) {
+        const c = this.cos[k], s = this.sin[k];
+        const rx = c * nx + s * bx, ry = c * ny + s * by, rz = c * nz + s * bz;
+        pos[o] = px + r * rx; pos[o + 1] = py + r * ry; pos[o + 2] = pz + r * rz;
+        nrm[o] = rx * capC + tx * capS; nrm[o + 1] = ry * capC + ty * capS; nrm[o + 2] = rz * capC + tz * capS;
+        uv[q] = k / S; uv[q + 1] = vc;
+        o += 3; q += 2;
+      }
+      const ci = i * 3;
+      this.cP[ci] = px; this.cP[ci + 1] = py; this.cP[ci + 2] = pz;
+      this.cT[ci] = tx; this.cT[ci + 1] = ty; this.cT[ci + 2] = tz;
+    }
+    commit() { this.aPos.needsUpdate = true; this.aNrm.needsUpdate = true; this.aUv.needsUpdate = true; }
+  }
+
+  /* Arc-length lookup of a curve: position and tangent at a given length. */
+  class ArcTable {
+    constructor(curve, K = 256) {
+      curve.arcLengthDivisions = 800; curve.updateArcLengths();
+      this.K = K; this.len = curve.getLength();
+      const pts = curve.getSpacedPoints(K);
+      this.p = new Float32Array((K + 1) * 3); this.t = new Float32Array((K + 1) * 3);
+      for (let i = 0; i <= K; i++) { this.p[i * 3] = pts[i].x; this.p[i * 3 + 1] = pts[i].y; this.p[i * 3 + 2] = pts[i].z; }
+      for (let i = 0; i <= K; i++) {
+        const a = pts[Math.max(0, i - 1)], b = pts[Math.min(K, i + 1)];
+        const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z, l = Math.hypot(dx, dy, dz) || 1;
+        this.t[i * 3] = dx / l; this.t[i * 3 + 1] = dy / l; this.t[i * 3 + 2] = dz / l;
+      }
+    }
+    _at(arr, a, out) {
+      const f = clamp01(a / this.len) * this.K, i = Math.min(this.K - 1, f | 0), r = f - i, o = i * 3;
+      out.set(arr[o] + (arr[o + 3] - arr[o]) * r, arr[o + 1] + (arr[o + 4] - arr[o + 1]) * r, arr[o + 2] + (arr[o + 5] - arr[o + 2]) * r);
+      return out;
+    }
+    pos(a, out) { return this._at(this.p, a, out); }
+    tan(a, out) { return this._at(this.t, a, out).normalize(); }
+  }
+
+  /* =================================================================
+     Blades: petals, sepals, leaves and cotyledons share one parametric
+     surface, re-evaluated on the CPU into a merged dynamic buffer.
+     ================================================================= */
+  const BP = { len: 1, wid: 0.2, shape: 0, c0: 0, c1: 0, c2: 0, c3: 0, psi0: 0, psi1: 0,
+               roll: 0, twist: 0, fold: 0, ruff: 0, ruffFreq: 8, phase: 0 };
+
+  function widthProfile(shape, u) {
+    switch (shape) {
+      case 0:  // petal: narrow claw, broad middle, pointed-round tip
+        return (0.24 + 0.76 * Math.sin(Math.PI * Math.pow(u, 1.2))) * Math.pow(1 - u * u * u, 0.6);
+      case 1:  // true leaf: short petiole, widest in the lower third, long drawn-out tip
+        return Math.pow(Math.sin(Math.PI * Math.pow(u, 0.62)), 1.35) * 0.97 + 0.03 * (1 - u);
+      case 2:  // cotyledon: small and round
+        return Math.pow(Math.sin(Math.PI * Math.pow(u, 0.85)), 0.62) * 0.96 + 0.04 * (1 - u) * (1 - u);
+      default: // sepal: broad base tapering to a point
+        return Math.pow(1 - Math.pow(u, 1.7), 0.78) * (0.8 + 0.2 * Math.sin(Math.PI * u));
+    }
+  }
+
+  class BladeBatch {
+    constructor(count, nu, nv, material) {
+      this.count = count; this.nu = nu; this.nv = nv; this.vertsPer = (nu + 1) * (nv + 1);
+      const vc = count * this.vertsPer;
+      this.pos = new Float32Array(vc * 3); this.nrm = new Float32Array(vc * 3);
+      const uv = new Float32Array(vc * 2), idx = [];
+      for (let b = 0; b < count; b++) {
+        const base = b * this.vertsPer;
+        for (let iu = 0; iu <= nu; iu++) for (let iv = 0; iv <= nv; iv++) {
+          const o = (base + iu * (nv + 1) + iv) * 2; uv[o] = iv / nv; uv[o + 1] = iu / nu;
+        }
+        for (let iu = 0; iu < nu; iu++) for (let iv = 0; iv < nv; iv++) {
+          const p00 = base + iu * (nv + 1) + iv, p10 = p00 + nv + 1, p01 = p00 + 1, p11 = p10 + 1;
+          idx.push(p00, p10, p01, p10, p11, p01);
+        }
+      }
+      const geo = new THREE.BufferGeometry();
+      this.aPos = new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage);
+      this.aNrm = new THREE.BufferAttribute(this.nrm, 3).setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute('position', this.aPos); geo.setAttribute('normal', this.aNrm);
+      geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+      geo.setIndex(idx);
+      this.mesh = new THREE.Mesh(geo, material);
+      this.mesh.frustumCulled = false; this.mesh.castShadow = true; this.mesh.receiveShadow = true;
+    }
+    collapse(i, x, y, z) {
+      let o = i * this.vertsPer * 3;
+      for (let k = 0; k < this.vertsPer; k++) {
+        this.pos[o] = x; this.pos[o + 1] = y; this.pos[o + 2] = z;
+        this.nrm[o] = 0; this.nrm[o + 1] = 1; this.nrm[o + 2] = 0; o += 3;
+      }
+    }
+    /* Blade i, attached at P with axis T and outward direction O (unit, perpendicular).
+       The midrib leaves P at angle theta(u) = c0 + c1 u + c2 u^2 + c3 sin(pi u) from T towards O.
+       Across the blade it is an arc of half-angle psi (cupping), rolled about the midrib. */
+    write(i, px, py, pz, tx, ty, tz, ox, oy, oz, p) {
+      const nu = this.nu, nv = this.nv, pos = this.pos;
+      const bx = ty * oz - tz * oy, by = tz * ox - tx * oz, bz = tx * oy - ty * ox;   // lateral = T x O
+      let o = i * this.vertsPer * 3, mx = px, my = py, mz = pz;
+      const du = 1 / nu, seg = p.len * du;
+      for (let iu = 0; iu <= nu; iu++) {
+        const u = iu * du;
+        if (iu > 0) {
+          const um = u - 0.5 * du, thm = p.c0 + p.c1 * um + p.c2 * um * um + p.c3 * Math.sin(Math.PI * um);
+          const sm = Math.sin(thm), cm = Math.cos(thm);
+          mx += seg * (sm * ox + cm * tx); my += seg * (sm * oy + cm * ty); mz += seg * (sm * oz + cm * tz);
+        }
+        const th = p.c0 + p.c1 * u + p.c2 * u * u + p.c3 * Math.sin(Math.PI * u);
+        const st = Math.sin(th), ct = Math.cos(th);
+        const nx = tx * st - ox * ct, ny = ty * st - oy * ct, nz = tz * st - oz * ct;  // upper / inward normal
+        const w = p.wid * widthProfile(p.shape, u);
+        const psi = p.psi0 + (p.psi1 - p.psi0) * u;
+        const tau = p.roll + p.twist * u, cta = Math.cos(tau), sta = Math.sin(tau);
+        const ruffK = p.ruff * w * u * u;
+        for (let iv = 0; iv <= nv; iv++) {
+          const v = iv / nv * 2 - 1, a = psi * v;
+          let lat, off;
+          if (psi < 1e-3 && psi > -1e-3) { lat = w * v; off = 0.5 * w * psi * v * v; }
+          else { lat = w * Math.sin(a) / psi; off = w * (1 - Math.cos(a)) / psi; }
+          off += p.fold * w * (Math.sqrt(v * v + 0.02) - 0.1414);
+          off += ruffK * Math.sin(p.ruffFreq * v + p.phase + 3.0 * u) * (0.25 + 0.75 * v * v);
+          const l2 = lat * cta - off * sta, o2 = lat * sta + off * cta;
+          pos[o] = mx + l2 * bx + o2 * nx; pos[o + 1] = my + l2 * by + o2 * ny; pos[o + 2] = mz + l2 * bz + o2 * nz;
+          o += 3;
+        }
+      }
+      this._normals(i);
+    }
+    _normals(i) {
+      const nu = this.nu, nv = this.nv, row = nv + 1, pos = this.pos, nrm = this.nrm, base = i * this.vertsPer * 3;
+      for (let iu = 0; iu <= nu; iu++) {
+        const ia = (iu > 0 ? iu - 1 : iu) * row, ib = (iu < nu ? iu + 1 : iu) * row, ic = iu * row;
+        for (let iv = 0; iv <= nv; iv++) {
+          const i0 = base + (ia + iv) * 3, i1 = base + (ib + iv) * 3;
+          const j0 = base + (ic + (iv > 0 ? iv - 1 : iv)) * 3, j1 = base + (ic + (iv < nv ? iv + 1 : iv)) * 3;
+          const ax = pos[i1] - pos[i0], ay = pos[i1 + 1] - pos[i0 + 1], az = pos[i1 + 2] - pos[i0 + 2];
+          const cx = pos[j1] - pos[j0], cy = pos[j1 + 1] - pos[j0 + 1], cz = pos[j1 + 2] - pos[j0 + 2];
+          let x = ay * cz - az * cy, y = az * cx - ax * cz, z = ax * cy - ay * cx;
+          const l = Math.hypot(x, y, z), o = base + (ic + iv) * 3;
+          if (l > 1e-12) { nrm[o] = x / l; nrm[o + 1] = y / l; nrm[o + 2] = z / l; }
+          else if (iu > 0) { const q = o - row * 3; nrm[o] = nrm[q]; nrm[o + 1] = nrm[q + 1]; nrm[o + 2] = nrm[q + 2]; }
+          else { nrm[o] = 0; nrm[o + 1] = 0; nrm[o + 2] = 0; }
+        }
+      }
+      for (let iv = 0; iv <= nv; iv++) {            // degenerate base row borrows from the next one
+        const o = base + iv * 3;
+        if (nrm[o] === 0 && nrm[o + 1] === 0 && nrm[o + 2] === 0) {
+          const q = o + row * 3; nrm[o] = nrm[q]; nrm[o + 1] = nrm[q + 1]; nrm[o + 2] = nrm[q + 2];
+        }
+      }
+    }
+    sample(i, iu, iv, P, N) {
+      const o = (i * this.vertsPer + iu * (this.nv + 1) + iv) * 3;
+      P.set(this.pos[o], this.pos[o + 1], this.pos[o + 2]); N.set(this.nrm[o], this.nrm[o + 1], this.nrm[o + 2]);
+    }
+    commit() { this.aPos.needsUpdate = true; this.aNrm.needsUpdate = true; }
+  }
+
+  /* =================================================================
+     Stage 2 — seed, root
+     ================================================================= */
+  const seed = {};
+  function createSeed() {
+    const A = 0.085, B = 0.052, C = 0.058;
+    const group = new THREE.Group(); group.position.set(0, 0.024, 0);
+    const shell = new THREE.SphereGeometry(1, 44, 26, 0, Math.PI); shell.scale(A, B, C);
+    const cap = new THREE.CircleGeometry(1, 44); cap.rotateY(Math.PI); cap.scale(A, B, 1);
+    const shellMat = new THREE.MeshPhysicalMaterial({
+      map: TEX.seed, bumpMap: TEX.seed, bumpScale: 0.6, roughness: 0.46,
+      sheen: 0.7, sheenColor: new THREE.Color('#e0a970'), sheenRoughness: 0.38,
+      clearcoat: 0.22, clearcoatRoughness: 0.55,
+    });
+    const capMat = new THREE.MeshStandardMaterial({ color: '#a8946a', roughness: 0.85 });
+    const makeHalf = () => {
+      const pivot = new THREE.Group(); pivot.position.y = -B * 0.9;       // hinge near the bottom of the seam
+      const holder = new THREE.Group(); holder.position.y = B * 0.9;
+      const m1 = new THREE.Mesh(shell, shellMat), m2 = new THREE.Mesh(cap, capMat);
+      m1.castShadow = m2.castShadow = true; m1.receiveShadow = m2.receiveShadow = true;
+      holder.add(m1, m2); pivot.add(holder); return pivot;
+    };
+    const a = makeHalf(), b = makeHalf(), wrapB = new THREE.Group();
+    wrapB.rotation.y = Math.PI; wrapB.add(b);
+    group.add(a, wrapB);
+    scene.add(group);
+    seed.group = group; seed.a = a; seed.b = b;
+
+    /* the root tip that dips into the soil */
+    const curve = new THREE.CatmullRomCurve3([
+      new V3(0.050, 0.008, 0.004), new V3(0.090, 0.016, 0.010), new V3(0.116, 0.002, 0.016),
+      new V3(0.130, -0.050, 0.020), new V3(0.136, -0.150, 0.024)], false, 'catmullrom', 0.5);
+    seed.rootArc = new ArcTable(curve, 64);
+    seed.rootMat = new THREE.MeshPhysicalMaterial({ color: '#a8997a', roughness: 0.6, sheen: 0.3, sheenColor: new THREE.Color('#fff4d8') });
+    seed.root = new GrowTube(22, 7, seed.rootMat);
+    scene.add(seed.root.mesh);
+  }
+
+  /* =================================================================
+     Stage 3 — stem and leaves
+     ================================================================= */
+  const stem = {};
+  const STEM_RINGS = 88, STEM_TIP = 7, STEM_SIDES = 12;
+  function createStem() {
+    const curve = new THREE.CatmullRomCurve3([
+      new V3(0.000, -0.035, 0.000), new V3(0.050, 0.50, 0.020), new V3(0.015, 1.15, -0.050),
+      new V3(-0.085, 1.80, -0.035), new V3(-0.045, 2.35, 0.030), new V3(0.030, 2.66, 0.090)], false, 'catmullrom', 0.5);
+    stem.arc = new ArcTable(curve, 320);
+    stem.len = stem.arc.len;
+    stem.colPale = new THREE.Color('#d3dc9e'); stem.colGreen = new THREE.Color('#4f8a3a');
+    stem.mat = new THREE.MeshPhysicalMaterial({
+      color: stem.colGreen.clone(), map: TEX.stem, roughnessMap: TEX.stem, bumpMap: TEX.stem, bumpScale: 0.35,
+      roughness: 0.62, clearcoat: 0.25, clearcoatRoughness: 0.5, sheen: 0.3, sheenColor: new THREE.Color('#cfe6a0'),
+    });
+    stem.tube = new GrowTube(STEM_RINGS, STEM_SIDES, stem.mat);
+    scene.add(stem.tube.mesh);
+    stem.L = 0; stem.body = 0; stem.rB = 0.02; stem.rT = 0.017; stem.flare = 0;
+    stem.tipP = new V3(); stem.tipT = new V3(0, 1, 0);
+  }
+
+  // Leaves: descriptors for the shared blade batch. kind 1 = true leaf, kind 2 = cotyledon.
+  const leaves = [], cotyledons = [];
+  function createLeaf(kind, cfg) {
+    const leaf = Object.assign({ kind, start: 0, dur: 3.4, phase: rr(0, 6.283) }, cfg);
+    (kind === 1 ? leaves : cotyledons).push(leaf);
+    return leaf;
+  }
+
+  /* =================================================================
+     Stage 4 — flower head
+     ================================================================= */
+  const head = {};
+  const petals = [];
+  const RING_DEFS = [   // outer -> inner
+    { n: 5,  len: 0.62, wid: 0.270, rho: 0.070, y: 0.000, phi0: 0.00, op0: 66, op2: -18, op3: 20, psiO0: 0.55, psiO1: 0.32, rollO: 0.13, start: 13.2, dur: 2.4, rip: 0.30 },
+    { n: 8,  len: 0.50, wid: 0.200, rho: 0.054, y: 0.012, phi0: 0.39, op0: 46, op2: -22, op3: 18, psiO0: 0.70, psiO1: 0.42, rollO: 0.20, start: 13.8, dur: 2.4, rip: 0.30 },
+    { n: 13, len: 0.36, wid: 0.125, rho: 0.038, y: 0.024, phi0: 0.16, op0: 27, op2: -24, op3: 12, psiO0: 0.85, psiO1: 0.50, rollO: 0.26, start: 14.4, dur: 2.3, rip: 0.30 },
+  ];
+  const CLOSED_C0 = 50 * D2R;
+  // closed profile: theta(u) = c0 - b u; solve b so the tip returns almost to the axis (a pointed bud)
+  function solveClosedCurl(len, rho, target) {
+    let lo = 2 * CLOSED_C0, hi = 3.0;
+    const f = (b) => rho + len * (Math.cos(CLOSED_C0 - b) - Math.cos(CLOSED_C0)) / b - target;
+    for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (f(mid) > 0) lo = mid; else hi = mid; }
+    return (lo + hi) / 2;
+  }
+  function createPetal(ringIndex, j) {
+    const d = RING_DEFS[ringIndex], phi = d.phi0 + j / d.n * Math.PI * 2;
+    const petal = {
+      ring: ringIndex, index: petals.length, phi, cos: Math.cos(phi), sin: Math.sin(phi),
+      len: d.len * rr(0.97, 1.03), wid: d.wid * rr(0.96, 1.04), op0: (d.op0 + rr(-2.5, 2.5)) * D2R,
+      delay: d.rip * j / d.n, phase: rr(0, 6.283), ruff: rr(0.05, 0.085), ruffFreq: rr(6.5, 9.5), twist: rr(-0.06, 0.06),
+    };
+    petals.push(petal);
+    return petal;
+  }
+
+  const STAMENS = 46, FIL_BEND = -0.028;
+  function createFlowerHead() {
+    const group = new THREE.Group(); scene.add(group); head.group = group;
+
+    /* receptacle */
+    const rec = new THREE.Mesh(new THREE.SphereGeometry(0.084, 24, 16), stem.mat);
+    rec.scale.set(1, 0.72, 1); rec.position.y = -0.014; rec.castShadow = true; rec.receiveShadow = true;
+    group.add(rec);
+
+    /* sepals */
+    head.sepalMat = foliageMaterial({
+      map: TEX.leaf, bumpMap: TEX.leafBump, bumpScale: 0.5, side: THREE.DoubleSide, color: new THREE.Color(0.92, 1.0, 0.86),
+      roughness: 0.58, clearcoat: 0.25, clearcoatRoughness: 0.5,
+    }, { transl: 0.5, tint: [0.75, 1.0, 0.4], edge: 0.5 });
+    head.sepals = new BladeBatch(5, 12, 8, head.sepalMat);
+    group.add(head.sepals.mesh);
+
+    /* petals: 5 + 8 + 13 */
+    head.petalMat = foliageMaterial({
+      map: TEX.petal, bumpMap: TEX.petalBump, bumpScale: 0.35, side: THREE.DoubleSide,
+      roughness: 0.56, sheen: 0.7, sheenColor: new THREE.Color('#ffc2d6'), sheenRoughness: 0.45,
+      envMapIntensity: 0.7,
+    }, { transl: 1.0, tint: [1.0, 0.82, 0.86], edge: 1.0, petal: true });
+    for (let r = 0; r < RING_DEFS.length; r++) {
+      const d = RING_DEFS[r];
+      d.closedC1 = -solveClosedCurl(d.len, d.rho, 0.012 + r * 0.002);
+      for (let j = 0; j < d.n; j++) createPetal(r, j);
+    }
+    head.petals = new BladeBatch(petals.length, 20, 10, head.petalMat);
+    group.add(head.petals.mesh);
+
+    /* stamens: instanced filaments + golden anthers */
+    const fil = new THREE.CylinderGeometry(0.0030, 0.0046, 1, 6, 6, true); fil.translate(0, 0.5, 0);
+    { const a = fil.attributes.position; for (let i = 0; i < a.count; i++) { const y = a.getY(i); a.setX(i, a.getX(i) + FIL_BEND * y * y); } fil.computeVertexNormals(); }
+    head.filMat = new THREE.MeshStandardMaterial({ color: '#f1e7a8', roughness: 0.5 });
+    head.filaments = new THREE.InstancedMesh(fil, head.filMat, STAMENS);
+    head.antherMat = new THREE.MeshStandardMaterial({ color: '#ffc94a', roughness: 0.55, emissive: new THREE.Color('#ff9e1f'), emissiveIntensity: 0.5 });
+    head.anthers = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), head.antherMat, STAMENS);
+    head.filaments.frustumCulled = false; head.anthers.frustumCulled = false;
+    head.filaments.castShadow = true; head.anthers.castShadow = true;
+    group.add(head.filaments, head.anthers);
+    head.stamens = [];
+    for (let k = 0; k < STAMENS; k++) {
+      const f = (k + 0.5) / STAMENS, phi = k * 2.39996323, rb = 0.012 + 0.024 * Math.sqrt(f);
+      head.stamens.push({
+        phi, bx: rb * Math.cos(phi), bz: rb * Math.sin(phi), len: rr(0.19, 0.275),
+        tiltC: (1.2 + 4 * f) * D2R, tiltO: (7 + 31 * Math.sqrt(f) + rr(-4, 4)) * D2R, delay: 0.5 * f + rr(0, 0.12),
+        as: rr(0.85, 1.15),
+      });
+    }
+
+    /* pistil */
+    const prof = [[0, 0], [0.020, 0.004], [0.029, 0.028], [0.024, 0.058], [0.011, 0.084], [0.0075, 0.160],
+                  [0.012, 0.174], [0.0135, 0.184], [0.009, 0.194], [0, 0.198]].map(p => new THREE.Vector2(p[0], p[1]));
+    head.pistil = new THREE.Mesh(new THREE.LatheGeometry(prof, 18), new THREE.MeshPhysicalMaterial({
+      color: '#b4cf4c', roughness: 0.28, clearcoat: 1, clearcoatRoughness: 0.2 }));
+    head.pistil.position.y = 0.02; head.pistil.castShadow = true;
+    group.add(head.pistil);
+
+    /* dew: tiny refractive drops */
+    const dewGeo = new THREE.SphereGeometry(1, 20, 14);
+    head.dewMat = new THREE.MeshPhysicalMaterial({ color: '#ffffff', roughness: 0.02, metalness: 0, transmission: 1, thickness: 0.04, ior: 1.33, envMapIntensity: 2.2 });
+    head.dewPetal = new THREE.InstancedMesh(dewGeo, head.dewMat, 4);
+    head.dewPetal.frustumCulled = false; group.add(head.dewPetal);
+    head.dewLeaf = new THREE.InstancedMesh(dewGeo, head.dewMat, 4);
+    head.dewLeaf.frustumCulled = false; scene.add(head.dewLeaf);
+    head.dewPetalDefs = [{ b: 0, iu: 11, iv: 7, r: 0.017 }, { b: 2, iu: 14, iv: 3, r: 0.014 }, { b: 3, iu: 9, iv: 6, r: 0.012 }, { b: 6, iu: 12, iv: 6, r: 0.011 }];
+    head.dewLeafDefs = [{ b: 0, iu: 9, iv: 7, r: 0.017 }, { b: 0, iu: 13, iv: 3, r: 0.011 }, { b: 1, iu: 10, iv: 6, r: 0.014 }, { b: 2, iu: 8, iv: 3, r: 0.012 }];
+  }
+
+  /* ---------- foliage on the stem ---------- */
+  const foliage = {};
+  function createFoliage() {
+    foliage.leafMat = foliageMaterial({
+      map: TEX.leaf, bumpMap: TEX.leafBump, bumpScale: 0.9, side: THREE.DoubleSide,
+      roughness: 0.52, clearcoat: 0.35, clearcoatRoughness: 0.42, sheen: 0.25, sheenColor: new THREE.Color('#d8f0a8'),
+    }, { transl: 0.65, tint: [0.8, 1.0, 0.35], edge: 0.5 });
+    foliage.cotMat = foliageMaterial({
+      map: TEX.cot, side: THREE.DoubleSide, roughness: 0.48, clearcoat: 0.45, clearcoatRoughness: 0.4,
+    }, { transl: 0.6, tint: [0.85, 1.0, 0.4], edge: 0.4 });
+    foliage.cotPale = new THREE.Color('#d6dc8c'); foliage.cotGreen = new THREE.Color('#6fae48'); foliage.cotOld = new THREE.Color('#b8a850');
+
+    const S = stem.len / 2.7;
+    createLeaf(1, { a: 0.80 * S, phi: -40 * D2R, len: 0.90, wid: 0.172, alpha: 58 * D2R, droop: 46 * D2R, twist: 0.32 });
+    createLeaf(1, { a: 1.22 * S, phi: 150 * D2R, len: 0.84, wid: 0.160, alpha: 56 * D2R, droop: 42 * D2R, twist: -0.36 });
+    createLeaf(1, { a: 1.62 * S, phi: -68 * D2R, len: 0.74, wid: 0.142, alpha: 54 * D2R, droop: 38 * D2R, twist: 0.28 });
+    createLeaf(1, { a: 1.98 * S, phi: 124 * D2R, len: 0.60, wid: 0.116, alpha: 52 * D2R, droop: 34 * D2R, twist: -0.30 });
+    createLeaf(2, { a: 0.30 * S, phi: 90 * D2R, len: 0.215, wid: 0.082 });
+    createLeaf(2, { a: 0.30 * S, phi: -90 * D2R, len: 0.205, wid: 0.078 });
+    for (const l of leaves) { l.cos = Math.cos(l.phi); l.sin = Math.sin(l.phi); }
+    for (const l of cotyledons) { l.cos = Math.cos(l.phi); l.sin = Math.sin(l.phi); }
+
+    foliage.leaves = new BladeBatch(leaves.length, 24, 10, foliage.leafMat);
+    foliage.cots = new BladeBatch(cotyledons.length, 12, 8, foliage.cotMat);
+    scene.add(foliage.leaves.mesh, foliage.cots.mesh);
+  }
+
+  /* ---------- drifting pollen / dust, far behind the plant ---------- */
+  const motes = {};
+  function createParticles() {
+    const N = 480, pos = new Float32Array(N * 3), sd = new Float32Array(N * 4);
+    for (let i = 0; i < N; i++) {
+      const r = 2.4 + 8.6 * Math.sqrt(rand()), th = rand() * Math.PI * 2;
+      pos[i * 3] = r * Math.cos(th); pos[i * 3 + 1] = -1.4 + 9 * rand(); pos[i * 3 + 2] = r * Math.sin(th);
+      sd[i * 4] = rand(); sd[i * 4 + 1] = rand(); sd[i * 4 + 2] = rand(); sd[i * 4 + 3] = rand();
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('aSeed', new THREE.BufferAttribute(sd, 4));
+    motes.uniforms = { uTime: { value: 0 }, uScale: { value: 1000 }, uPlantDist: { value: 2 }, uLevel: { value: 1 } };
+    const mat = new THREE.ShaderMaterial({
+      uniforms: motes.uniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: /* glsl */`
+        attribute vec4 aSeed;
+        uniform float uTime, uScale, uPlantDist, uLevel;
+        varying float vA;
+        void main() {
+          const float W = 0.3141592653;                     // 2 pi / loop length: motion closes exactly at the seam
+          float a = aSeed.x * 6.2831853, b = aSeed.y * 6.2831853, c = aSeed.z * 6.2831853;
+          vec3 p = position;
+          p.x += 0.40 * sin(W * uTime + a) + 0.14 * sin(2.0 * W * uTime + b);
+          p.y += 0.34 * sin(W * uTime + c) + 0.12 * sin(3.0 * W * uTime + a);
+          p.z += 0.40 * cos(W * uTime + b) + 0.14 * sin(2.0 * W * uTime + c);
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          float depth = -mv.z;
+          float behind = smoothstep(uPlantDist + 0.9, uPlantDist + 2.4, depth);   // never in front of the flower
+          float tw = 0.65 + 0.35 * sin(4.0 * W * uTime + aSeed.w * 40.0);
+          float big = aSeed.w * aSeed.w;
+          float size = mix(0.016, 0.062, big);
+          vA = behind * tw * uLevel * mix(1.0, 0.35, smoothstep(3.0, 13.0, depth - uPlantDist)) * mix(0.95, 0.28, big);
+          gl_PointSize = max(1.5, size * uScale / depth);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: /* glsl */`
+        varying float vA;
+        void main() {
+          float d = length(gl_PointCoord - 0.5) * 2.0;
+          float a = smoothstep(1.0, 0.3, d);
+          gl_FragColor = vec4(vec3(1.0, 0.85, 0.62) * a * vA * 0.42, 1.0);
+        }`,
+    });
+    motes.points = new THREE.Points(geo, mat);
+    motes.points.frustumCulled = false; motes.points.renderOrder = 5;
+    scene.add(motes.points);
+  }
+
+  /* =================================================================
+     Stage 6 — lighting
+     ================================================================= */
+  const lights = {};
+  const KEY_DIR = new V3(Math.sin(-125 * D2R) * Math.cos(42 * D2R), Math.sin(42 * D2R), Math.cos(-125 * D2R) * Math.cos(42 * D2R)).normalize();
+  function setupLights() {
+    lights.hemi = new THREE.HemisphereLight(0x8ea8dc, 0x1c140e, 0.5);
+    scene.add(lights.hemi);
+
+    // key: warm, soft, from upper-left behind the flower -> rim light and glow through the petals
+    lights.key = new THREE.DirectionalLight(0xffd7a6, 3);
+    lights.key.castShadow = true;
+    lights.key.shadow.mapSize.set(2048, 2048);
+    lights.key.shadow.bias = -0.0004; lights.key.shadow.normalBias = 0.012; lights.key.shadow.radius = 3.5;
+    lights.key.shadow.camera.near = 1; lights.key.shadow.camera.far = 40;
+    scene.add(lights.key, lights.key.target);
+    lights.keyCool = new THREE.Color('#b4c2ff'); lights.keyWarm = new THREE.Color('#ffd3a0');
+    lights.shadowHalf = -1;
+
+    // fill: cool and dim from the front so nothing falls to black
+    lights.fill = new THREE.DirectionalLight(0x9db8ff, 0.5);
+    lights.fill.position.set(Math.sin(8 * D2R) * 9, 2.4, Math.cos(8 * D2R) * 9);
+    scene.add(lights.fill);
+
+    // procedural environment for gentle reflections
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const room = new RoomEnvironment();
+    scene.environment = pmrem.fromScene(room, 0.04).texture;
+    scene.environmentIntensity = 0.3;
+    room.traverse?.((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+    pmrem.dispose();
+  }
+
+  /* =================================================================
+     Timeline tracks (all in growth-clock seconds)
+     ================================================================= */
+  let TR = null;
+  function buildTracks() {
+    const S = stem.len / 2.7;
+    TR = {
+      seedOpen: track([[2.0, 0], [2.5, 0.2], [3.3, 0.78], [4.3, 1.0], [6.0, 1.06]]),
+      rootLen: track([[2.05, 0], [2.9, 0.78], [3.7, 1.0]]),
+      stemLen: track([[2.3, 0], [3.2, 0.17 * S], [4.6, 0.30 * S], [5.6, 0.50 * S], [7.0, 1.06 * S], [8.5, 1.76 * S],
+                      [10.0, 2.30 * S], [11.5, 2.58 * S], [13.0, stem.len]]),
+      hook: track([[2.3, 3.0], [3.1, 2.95], [3.9, 1.45], [4.6, 0.14], [5.2, 0]]),
+      rBase: track([[2.3, 0.0115], [5, 0.0155], [9, 0.033], [13, 0.044], [17, 0.047]]),
+      rTip: track([[2.3, 0.0095], [5, 0.0105], [10, 0.019], [13, 0.027]]),
+      cotOpen: track([[3.9, 0], [4.5, 0.22], [5.5, 1.0]]),
+      cotSize: track([[2.3, 0.62], [6.5, 1.0]]),
+      headScale: track([[4.5, 0], [5.8, 0.065], [9.4, 0.12], [10.4, 0.21], [13.0, 0.72], [16.6, 1.0]]),
+      green: track([[10.0, 1.2], [11.2, 0.92], [12.6, 0.28], [13.5, 0]]),
+      dawn: track([[-0.4, 0.40], [2.0, 0.60], [6, 0.74], [11, 0.88], [15.5, 1.0]]),
+      elev: track([[-0.4, 11], [3, 9], [6, 6.5], [10, 7.5], [13, 12], [16.5, 22], [19.45, 25]]),
+    };
+    // a leaf appears as the growing tip passes its node
+    for (const l of leaves) {
+      let lo = 2.3, hi = 13;
+      for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (TR.stemLen(mid) < l.a + 0.03) lo = mid; else hi = mid; }
+      l.start = (lo + hi) / 2;
+    }
+  }
+
+  /* =================================================================
+     Per-frame updates. No allocations below this line.
+     ================================================================= */
+  const tT = new V3(), tP = new V3(), tO = new V3(), tN = new V3(), tQ = new V3();
+  const wind = { x: 0, z: 0 };
+  const UP = new V3(0, 1, 0);
+  const dummy = new THREE.Object3D(); dummy.rotation.order = 'YZX';
+  const dQuat = new THREE.Quaternion(), dQuat2 = new THREE.Quaternion(), dScale = new V3(), dMat = new THREE.Matrix4();
+  const focus = new V3(), focusT = new V3();
+
+  function windAt(s) {
+    wind.x = 0.55 * Math.sin(0.83 * s + 0.7) + 0.30 * Math.sin(1.9 * s + 2.1) + 0.15 * Math.sin(3.7 * s + 0.3);
+    wind.z = 0.50 * Math.sin(0.67 * s + 1.9) + 0.32 * Math.sin(2.3 * s + 0.4) + 0.14 * Math.sin(4.3 * s + 1.1);
+  }
+
+  function stemRadiusAt(a) {
+    const rel = stem.L > 1e-5 ? clamp01(a / stem.L) : 0;
+    return stem.rT + (stem.rB - stem.rT) * Math.pow(1 - rel, 1.25) + stem.flare * Math.exp(-a / 0.07);
+  }
+
+  // The stem is laid out from the base by integrating its tangent: new length always appears at the tip.
+  function updateStem(G, windAmp) {
+    const L = stem.L, tube = stem.tube, arc = stem.arc;
+    const hook = TR.hook(G), tipLen = Math.min(0.03, L * 0.35), body = L - tipLen;
+    const hookLen = Math.max(1e-4, Math.min(L * 0.95, 0.18));
+    stem.body = body; stem.rB = TR.rBase(G); stem.rT = TR.rTip(G); stem.flare = 0.010 * smooth(6, 13, G);
+    arc.pos(0, tP);
+    let px = tP.x, py = tP.y, pz = tP.z, pa = 0, ptx = 0, pty = 1, ptz = 0;
+    const nBody = STEM_RINGS - STEM_TIP;
+    tube.start(1, 0, 0);
+    for (let i = 0; i <= STEM_RINGS; i++) {
+      let a, capS = 0, capC = 1;
+      if (i <= nBody) a = body * i / nBody;
+      else { const ang = (i - nBody) / STEM_TIP * Math.PI / 2; capS = Math.sin(ang); capC = Math.cos(ang); a = body + tipLen * capS; }
+      arc.tan(a, tT);
+      if (hook > 1e-4) {                                   // the sprout hook: bend the top of the shoot over
+        const A = hook * smooth(L - hookLen, L, a), ca = Math.cos(A), sa = Math.sin(A);
+        const x = tT.x * ca - tT.y * sa, y = tT.x * sa + tT.y * ca; tT.x = x; tT.y = y;
+      }
+      const k = windAmp * Math.pow(a / stem.len, 1.15);    // breeze: stronger towards the tip
+      tT.x += wind.x * k; tT.z += wind.z * k; tT.normalize();
+      if (i > 0) { const ds = a - pa; px += 0.5 * (ptx + tT.x) * ds; py += 0.5 * (pty + tT.y) * ds; pz += 0.5 * (ptz + tT.z) * ds; }
+      const r = Math.max(0.0006, stemRadiusAt(a) * capC);
+      tube.setRing(i, px, py, pz, tT.x, tT.y, tT.z, r, a * 2.4, capS, capC);
+      pa = a; ptx = tT.x; pty = tT.y; ptz = tT.z;
+    }
+    tube.commit();
+    stem.tipP.set(px, py, pz); stem.tipT.set(ptx, pty, ptz);
+  }
+
+  function stemSample(a, P, T) {
+    const n = STEM_RINGS - STEM_TIP, cP = stem.tube.cP, cT = stem.tube.cT;
+    const f = stem.body > 1e-6 ? clamp01(a / stem.body) * n : 0, i = Math.min(n - 1, f | 0), r = f - i, o = i * 3;
+    P.set(cP[o] + (cP[o + 3] - cP[o]) * r, cP[o + 1] + (cP[o + 4] - cP[o + 1]) * r, cP[o + 2] + (cP[o + 5] - cP[o + 2]) * r);
+    T.set(cT[o] + (cT[o + 3] - cT[o]) * r, cT[o + 1] + (cT[o + 4] - cT[o + 1]) * r, cT[o + 2] + (cT[o + 5] - cT[o + 2]) * r).normalize();
+  }
+  // outward direction at azimuth (cos, sin), made perpendicular to the local stem tangent
+  function outward(cosP, sinP, T, O) {
+    const d = cosP * T.x + sinP * T.z;
+    O.set(cosP - d * T.x, -d * T.y, sinP - d * T.z).normalize();
+  }
+
+  function updateRoot(G) {
+    const tube = seed.root, arc = seed.rootArc, L = TR.rootLen(G) * arc.len;
+    tube.mesh.visible = L > 1e-4;
+    if (!tube.mesh.visible) return;
+    const n = tube.rings;
+    tube.start(0, 0, 1);
+    for (let i = 0; i <= n; i++) {
+      const f = i / n, a = L * f;
+      arc.pos(a, tP); arc.tan(a, tT);
+      const r = Math.max(0.0005, (0.0075 - 0.0035 * a / arc.len) * Math.sqrt(1 - Math.pow(f, 6)));
+      tube.setRing(i, tP.x, tP.y, tP.z, tT.x, tT.y, tT.z, r, a * 4, 0, 1);
+    }
+    tube.commit();
+  }
+
+  function updateCotyledons(G, s) {
+    const batch = foliage.cots, L = stem.L;
+    if (L < 0.004) { for (let i = 0; i < 2; i++) batch.collapse(i, 0, -0.03, 0); batch.commit(); batch.mesh.visible = false; return; }
+    batch.mesh.visible = true;
+    const co = TR.cotOpen(G), wi = smooth(10.5, 16.5, G), size = TR.cotSize(G) * (1 - 0.14 * wi);
+    const openK = co + 0.05 * Math.sin(Math.PI * clamp01((co - 0.6) / 0.4)) ;
+    foliage.cotMat.color.lerpColors(foliage.cotPale, foliage.cotGreen, smooth(3.6, 6.6, G)).lerp(foliage.cotOld, wi * 0.6);
+    for (let i = 0; i < 2; i++) {
+      const c = cotyledons[i], a = Math.min(stem.body, c.a);   // rides the tip until the stem grows past its node
+      stemSample(a, tP, tT);
+      tO.set(-tT.y, tT.x, 0).normalize().multiplyScalar(i ? -1 : 1);   // in the plane of the hook
+      const r = stemRadiusAt(a) * 0.7;
+      BP.len = c.len * size; BP.wid = c.wid * size * lerp(0.86, 1, co); BP.shape = 2;
+      BP.c0 = lerp(4, 80, openK) * D2R + wi * 22 * D2R + 0.02 * Math.sin(1.9 * s + i * 2.4) * co;
+      BP.c1 = 0; BP.c2 = lerp(0, 12, co) * D2R + wi * 32 * D2R; BP.c3 = 0;
+      BP.psi0 = BP.psi1 = lerp(0.55, 0.12, co) + wi * 0.55;
+      BP.roll = 0; BP.twist = wi * 0.3 * (i ? -1 : 1); BP.fold = 0.08 * co; BP.ruff = 0; BP.phase = 0;
+      batch.write(i, tP.x + tO.x * r, tP.y + tO.y * r, tP.z + tO.z * r, tT.x, tT.y, tT.z, tO.x, tO.y, tO.z, BP);
+    }
+    batch.commit();
+  }
+
+  function updateLeaves(G, s) {
+    const batch = foliage.leaves;
+    for (let i = 0; i < leaves.length; i++) {
+      const l = leaves[i], g = clamp01((G - l.start) / l.dur);
+      stemSample(Math.min(l.a, stem.L), tP, tT);
+      if (g <= 0) { batch.collapse(i, tP.x, tP.y, tP.z); continue; }
+      outward(l.cos, l.sin, tT, tO);
+      const size = smoother(0, 1, Math.pow(g, 0.82));       // grows from a primordium hidden at the node
+      const un = smooth(0.14, 0.82, g);                      // unrolling
+      const sp = smooth(0.22, 1.0, g);                       // swinging away from the stem
+      const flut = Math.sin(1.7 * s + l.phase) * 0.03 + Math.sin(2.9 * s + l.phase * 1.7) * 0.014;
+      const r = stemRadiusAt(l.a) * 0.75;
+      BP.len = l.len * size; BP.wid = l.wid * size * lerp(0.55, 1, un); BP.shape = 1;
+      BP.c0 = lerp(7 * D2R, l.alpha, sp) + flut * sp; BP.c1 = 0;
+      BP.c2 = lerp(-10 * D2R, l.droop, smooth(0.35, 1, g)) + flut * 0.8 * sp; BP.c3 = 9 * D2R * sp;
+      BP.psi0 = BP.psi1 = lerp(2.6, 0.16, un);
+      BP.roll = 0; BP.twist = l.twist * sp + 0.05 * Math.sin(2.3 * s + l.phase) * sp;
+      BP.fold = 0.22 * un; BP.ruff = 0.04 * un; BP.ruffFreq = 9; BP.phase = l.phase;
+      batch.write(i, tP.x + tO.x * r, tP.y + tO.y * r, tP.z + tO.z * r, tT.x, tT.y, tT.z, tO.x, tO.y, tO.z, BP);
+    }
+    batch.commit();
+  }
+
+  function updateHead(G, s, hs) {
+    const group = head.group;
+    group.visible = hs > 0.002;
+    if (!group.visible) return;
+    group.position.copy(stem.tipP).addScaledVector(stem.tipT, -0.012 * hs);
+    group.quaternion.setFromUnitVectors(UP, stem.tipT);
+    group.scale.setScalar(hs);
+
+    /* sepals wrap the bud, then fold back */
+    const so = openCurve((G - 12.9) / 1.9);
+    for (let k = 0; k < 5; k++) {
+      const phi = (36 + 72 * k) * D2R, c = Math.cos(phi), sn = Math.sin(phi), rho = 0.09;
+      BP.len = 0.5; BP.wid = 0.122; BP.shape = 3;
+      BP.c0 = lerp(66, 100, so) * D2R; BP.c1 = lerp(-112, 45, so) * D2R; BP.c2 = 0; BP.c3 = 12 * D2R * so;
+      BP.psi0 = lerp(0.62, 0.25, so); BP.psi1 = lerp(0.35, 0.10, so);
+      BP.roll = 0; BP.twist = 0; BP.fold = 0.10; BP.ruff = 0; BP.phase = 0;
+      head.sepals.write(k, rho * c, -0.012, rho * sn, 0, 1, 0, c, 0, sn, BP);
+    }
+    head.sepals.commit();
+
+    /* petals: ring by ring, outer first, rippling around each ring */
+    const breathe = 0.012 * smooth(16.5, 17.5, G);
+    for (let i = 0; i < petals.length; i++) {
+      const p = petals[i], d = RING_DEFS[p.ring];
+      const o = openCurve((G - d.start - p.delay) / d.dur) + breathe * Math.sin(1.3 * s + p.phase);
+      BP.len = p.len; BP.wid = p.wid; BP.shape = 0;
+      BP.c0 = lerp(CLOSED_C0, p.op0, o); BP.c1 = lerp(d.closedC1, 0, o);
+      BP.c2 = d.op2 * D2R * o; BP.c3 = d.op3 * D2R * o;
+      BP.psi0 = lerp(1.0, d.psiO0, o); BP.psi1 = lerp(1.5, d.psiO1, o);
+      BP.roll = lerp(0.15, d.rollO, o) + 0.08 * Math.sin(Math.PI * clamp01(o));   // imbrication: edges slide past each other
+      BP.twist = p.twist * o; BP.fold = 0; BP.ruff = p.ruff * (0.3 + 0.7 * o); BP.ruffFreq = p.ruffFreq; BP.phase = p.phase;
+      head.petals.write(i, d.rho * p.cos, d.y, d.rho * p.sin, 0, 1, 0, p.cos, 0, p.sin, BP);
+    }
+    head.petals.commit();
+    shared.uGreen.value = TR.green(G);
+
+    /* stamens: tight bundle -> spread crown */
+    for (let k = 0; k < STAMENS; k++) {
+      const st = head.stamens[k], o = openCurve((G - 14.6 - st.delay) / 2.2);
+      const tilt = lerp(st.tiltC, st.tiltO, o) + 0.015 * Math.sin(2.1 * s + k) * o;
+      const len = st.len * lerp(0.6, 1, smooth(0, 1, o));
+      dummy.position.set(st.bx, 0.03, st.bz); dummy.rotation.set(0, -st.phi, -tilt); dummy.scale.set(1, len, 1);
+      dummy.updateMatrix(); head.filaments.setMatrixAt(k, dummy.matrix);
+      tQ.set(FIL_BEND, len, 0).applyQuaternion(dummy.quaternion);
+      dummy.position.set(st.bx + tQ.x, 0.03 + tQ.y, st.bz + tQ.z);
+      dummy.scale.set(0.0115 * st.as, 0.021 * st.as, 0.0085 * st.as);
+      dummy.updateMatrix(); head.anthers.setMatrixAt(k, dummy.matrix);
+    }
+    head.filaments.instanceMatrix.needsUpdate = true; head.anthers.instanceMatrix.needsUpdate = true;
+    head.antherMat.emissiveIntensity = 0.25 + 0.55 * smooth(14.5, 17, G);
+  }
+
+  function placeDrop(mesh, k, P, N, r, squash) {
+    dummy.position.copy(P).addScaledVector(N, r * 0.5);
+    dummy.quaternion.setFromUnitVectors(UP, N);
+    dummy.scale.set(r, r * squash, r);
+    dummy.updateMatrix(); mesh.setMatrixAt(k, dummy.matrix);
+  }
+  function updateDew(G) {
+    const dew = smooth(15.4, 17.2, G);
+    head.dewPetal.visible = head.dewLeaf.visible = dew > 0.001;
+    if (dew <= 0.001) return;
+    for (let k = 0; k < head.dewPetalDefs.length; k++) {
+      const d = head.dewPetalDefs[k]; head.petals.sample(d.b, d.iu, d.iv, tP, tN);
+      placeDrop(head.dewPetal, k, tP, tN, d.r * dew, 0.82);
+    }
+    for (let k = 0; k < head.dewLeafDefs.length; k++) {
+      const d = head.dewLeafDefs[k]; foliage.leaves.sample(d.b, d.iu, d.iv, tP, tN);
+      placeDrop(head.dewLeaf, k, tP, tN, d.r * dew, 0.8);
+    }
+    head.dewPetal.instanceMatrix.needsUpdate = true; head.dewLeaf.instanceMatrix.needsUpdate = true;
+    dummy.rotation.set(0, 0, 0);
+  }
+
+  function updateCrumbs(G) {
+    const push = smooth(2.35, 3.7, G);
+    if (Math.abs(push - soil.lastPush) < 1e-5) return;
+    soil.lastPush = push;
+    for (let n = 0; n < soil.near.length; n++) {
+      const c = soil.near[n], k = smooth(c.late, 1, push) * c.w;
+      tP.set(c.pos.x + c.dx * 0.045 * k, c.pos.y + 0.022 * k, c.pos.z + c.dz * 0.045 * k);
+      dQuat2.setFromAxisAngle(tN.set(-c.dz, 0, c.dx), c.spin * 0.9 * k);
+      dQuat.copy(dQuat2).multiply(c.quat);
+      dMat.compose(tP, dQuat, c.scale);
+      soil.crumbs.setMatrixAt(c.i, dMat);
+    }
+    soil.crumbs.instanceMatrix.needsUpdate = true;
+  }
+
+  function updateLights(G, focusY) {
+    const dawn = TR.dawn(G);                                // light arrives like dawn
+    lights.key.intensity = 4.2 * dawn;
+    lights.key.color.lerpColors(lights.keyCool, lights.keyWarm, smooth(0.3, 0.85, dawn));
+    lights.fill.intensity = 0.55 * (0.4 + 0.6 * dawn);
+    lights.hemi.intensity = 0.34 * (0.4 + 0.6 * dawn);
+    scene.environmentIntensity = 0.3 * dawn;
+    shared.uBgLevel.value = 0.3 + 0.7 * dawn;
+    lights.key.target.position.set(0, focusY * 0.45, 0);
+    lights.key.position.copy(lights.key.target.position).addScaledVector(KEY_DIR, 16);
+    const half = 0.8 + 0.78 * focusY;                       // shadow frustum follows the size of the plant
+    if (Math.abs(half - lights.shadowHalf) > 1e-4) {
+      lights.shadowHalf = half;
+      const cam = lights.key.shadow.camera;
+      cam.left = -half; cam.right = half; cam.top = half; cam.bottom = -half; cam.updateProjectionMatrix();
+    }
+    shared.uBackColor.value.copy(lights.key.color).multiplyScalar(lights.key.intensity * 0.26);
+    motes.uniforms.uLevel.value = 0.35 + 0.65 * dawn;
+  }
+
+  // One slow continuous move: low and close on the seed, rising with the stem, orbiting ~80 degrees.
+  function updateCamera(G, hs) {
+    const hook = TR.hook(G), L = stem.L;
+    if (L <= 0) { focus.set(0, 0.03, 0); focusT.set(0, 1, 0); }
+    else {
+      const aF = L * (1 - 0.65 * Math.min(1, hook / 2.6));
+      stem.arc.pos(aF, focus); stem.arc.tan(aF, focusT);
+      focus.addScaledVector(focusT, 0.2 * hs);
+      if (focus.y < 0.03) focus.y = 0.03;
+    }
+    const d = Math.cbrt(1.5 * 1.5 * 1.5 + Math.pow(lerp(2.85, 2.6, smooth(9, 16, G)) * focus.y, 3));
+    const x = (G + PRE) / (T_BLACK0 + PRE);
+    const az = (-35 + 81 * (0.6 * x + 0.4 * smooth(0, 1, x))) * D2R, el = TR.elev(G) * D2R;
+    camera.position.set(focus.x + d * Math.sin(az) * Math.cos(el), focus.y + d * Math.sin(el), focus.z + d * Math.cos(az) * Math.cos(el));
+    camera.lookAt(focus);
+    camera.rotateX(-Math.atan((lerp(0.58, TIP_SCREEN_Y, smooth(2.5, 9, G)) - 0.5) * tipPitchK));   // tip in the upper-middle third
+    camera.updateMatrixWorld(true);
+    shared.uBackDir.value.copy(KEY_DIR).transformDirection(camera.matrixWorldInverse);
+    motes.uniforms.uPlantDist.value = d;
+    return focus.y;
+  }
+
+  /* ---------- the single entry point: any t in [0, 1] gives the complete frame ---------- */
+  let finalPass = null;
+  function updateGrowth(t) {
+    const s = (t - Math.floor(t)) * LOOP;
+    const G = growthClock(s);
+    windAt(s);
+    const windAmp = 0.02 + 0.034 * smooth(15.8, 17.6, G);
+
+    // seed: splits along its seam, the halves settle on the soil
+    const so = TR.seedOpen(G);
+    seed.a.rotation.x = so; seed.b.rotation.x = so * 0.9;
+    seed.a.position.z = 0.016 * so; seed.b.position.z = 0.013 * so;
+    seed.a.rotation.z = 0.10 * so; seed.b.rotation.z = -0.07 * so;
+    updateRoot(G);
+
+    // stem
+    stem.L = TR.stemLen(G);
+    stem.tube.mesh.visible = stem.L > 1e-4;
+    if (stem.tube.mesh.visible) updateStem(G, windAmp);
+    else { stem.arc.pos(0, stem.tipP); stem.tipT.set(0, 1, 0); stem.body = 0; }
+    stem.mat.color.lerpColors(stem.colPale, stem.colGreen, smooth(3.3, 6.6, G));
+
+    updateCotyledons(G, s);
+    updateLeaves(G, s);
+    const hs = TR.headScale(G);
+    updateHead(G, s, hs);
+    updateDew(G);
+    updateCrumbs(G);
+
+    const focusY = updateCamera(G, hs);
+    updateLights(G, focusY);
+    motes.uniforms.uTime.value = s;
+    if (finalPass) finalPass.uniforms.uFade.value = veilAt(s);
+  }
+
+  /* =================================================================
+     Build
+     ================================================================= */
+  setupCamera();
+  createBackground();
+  createSoil();
+  createSeed();
+  createStem();
+  createFoliage();
+  createFlowerHead();
+  createParticles();
+  setupLights();
+  buildTracks();
+
+  /* ---------- post: restrained bloom, vignette, loop veil ---------- */
+  const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 }));
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(new THREE.Vector2(4, 4), 0.34, 0.65, 0.86);
+  composer.addPass(bloom);
+  finalPass = new ShaderPass({
+    uniforms: { tDiffuse: { value: null }, uFade: { value: 1 }, uVig: { value: 0.62 } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: /* glsl */`
+      uniform sampler2D tDiffuse; uniform float uFade; uniform float uVig; varying vec2 vUv;
+      void main() {
+        vec4 c = texture2D(tDiffuse, vUv);
+        vec2 p = (vUv - 0.5) * vec2(1.0, 1.12);
+        float v = smoothstep(0.86, 0.22, length(p));
+        c.rgb *= mix(1.0, v, uVig) * uFade;
+        gl_FragColor = c;
+      }`,
+  });
+  composer.addPass(finalPass);
+  composer.addPass(new OutputPass());
+
+  /* ---------- 9:16 frame ---------- */
+  function layout() {
+    const ww = Math.max(1, window.innerWidth), wh = Math.max(1, window.innerHeight);
+    let w, h;
+    if (ww / wh > 9 / 16) { h = wh; w = Math.max(1, Math.round(wh * 9 / 16)); }   // wider: centred 9:16 with dark bars
+    else { w = ww; h = wh; }                                                       // taller: fill, keep the horizontal framing
+    const pr = Math.min(window.devicePixelRatio || 1, 2);
+    renderer.setPixelRatio(pr); renderer.setSize(w, h);
+    composer.setPixelRatio(pr); composer.setSize(w, h);
+    const aspect = w / h, hHalf = Math.tan(BASE_FOV * D2R / 2) * (9 / 16);
+    const vHalf = Math.min(hHalf / aspect, Math.tan(38 * D2R));
+    camera.aspect = aspect; camera.fov = 2 * Math.atan(vHalf) / D2R; camera.updateProjectionMatrix();
+    tipPitchK = 2 * vHalf;
+    shared.uRes.value.set(w * pr, h * pr); shared.uAspect.value = aspect;
+    motes.uniforms.uScale.value = h * pr / (2 * vHalf);
+  }
+  layout();
+  window.addEventListener('resize', layout);
+
+  /* ---------- clock, ?t= freeze, Space pause ---------- */
+  let time = 0, paused = false, last = performance.now();
+  const q = new URLSearchParams(location.search);
+  if (q.has('t')) { const v = parseFloat(q.get('t')); if (Number.isFinite(v)) { time = clamp01(v) * LOOP; paused = true; } }
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') { e.preventDefault(); paused = !paused; }
+    else if (paused && e.code === 'ArrowRight') time = (time + 0.1) % LOOP;
+    else if (paused && e.code === 'ArrowLeft') time = (time - 0.1 + LOOP) % LOOP;
+  });
+
+  function animate(now) {
+    requestAnimationFrame(animate);
+    const dt = Math.min(Math.max((now - last) / 1000, 0), 0.1);   // clamp after a hidden tab resumes
+    last = now;
+    if (!paused) time = (time + dt) % LOOP;
+    updateGrowth(time / LOOP);
+    composer.render();
+  }
+
+  // small hook for capturing stills: bloom.seek(0.75), bloom.play()
+  window.bloom = {
+    updateGrowth,
+    seek(t) { time = clamp01(t) * LOOP; paused = true; },
+    play() { paused = false; },
+    get t() { return time / LOOP; },
+  };
+
+  updateGrowth(time / LOOP);
+  composer.render();
+  requestAnimationFrame((now) => { last = now; animate(now); });
+}
+
+main();
+</script>
+</body>
+</html>

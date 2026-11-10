@@ -1,0 +1,15 @@
+{
+  "name": "nodal-studio",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "NODAL — a vibe-code studio site where every page is a resonance of a vibrating plate.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

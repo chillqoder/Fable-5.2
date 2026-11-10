@@ -1,0 +1,53 @@
+- generic [active] [ref=f3e1]:
+  - banner [ref=f3e3]:
+    - generic [ref=f3e4]: NODAL
+    - generic [ref=f3e5]: AI development studio
+  - navigation "Разделы сайта" [ref=f3e6]:
+    - button "Студия" [ref=f3e7] [cursor=pointer]
+    - button "Процесс" [ref=f3e8] [cursor=pointer]
+    - button "Услуги" [ref=f3e9] [cursor=pointer]
+    - button "Подход" [ref=f3e10] [cursor=pointer]
+    - button "Форматы" [ref=f3e11] [cursor=pointer]
+    - button "Контакт" [ref=f3e12] [cursor=pointer]
+  - complementary [ref=f3e13]:
+    - generic [ref=f3e14]: 055.0Hz
+    - generic [ref=f3e15]:
+      - generic [ref=f3e16]: mode 1·2
+      - generic "resonance lock" [ref=f3e17]
+    - button "звук выкл." [ref=f3e26] [cursor=pointer]
+  - main:
+    - region "Студия":
+      - paragraph [ref=f3e27]: Студия AI-разработки · от идеи до запуска
+      - heading [level=2] [ref=f3e28]:
+        - text: Ваша идея.Наш код.
+        - emphasis [ref=f3e29]: Живой продукт.
+      - paragraph [ref=f3e30]: Создаём сайты, приложения и MVP с помощью AI. Вы приносите идею — мы проектируем, пишем код, тестируем и запускаем.
+      - generic [ref=f3e31]:
+        - button "Обсудить проект ↗" [ref=f3e32] [cursor=pointer]:
+          - text: Обсудить проект
+          - generic [ref=f3e33]: ↗
+        - button "Что мы делаем →" [ref=f3e34] [cursor=pointer]
+      - list:
+        - listitem:
+          - generic: Из шума — в форму
+          - text: "Так и с идеей: находим структуру, убираем лишнее, собираем продукт."
+  - navigation "Frequency dial" [ref=f3e35]:
+    - generic:
+      - generic [ref=f3e37]: "43"
+      - generic [ref=f3e58]: "70"
+      - generic [ref=f3e79]: "113"
+      - generic [ref=f3e100]: "183"
+      - generic [ref=f3e121]: "296"
+      - generic [ref=f3e142]: "480"
+      - generic [ref=f3e163]: "776"
+      - button "055Студия" [ref=f3e164] [cursor=pointer]
+      - button "089Процесс" [ref=f3e165] [cursor=pointer]
+      - button "144Услуги" [ref=f3e166] [cursor=pointer]
+      - button "233Подход" [ref=f3e167] [cursor=pointer]
+      - button "377Форматы" [ref=f3e168] [cursor=pointer]
+      - button "610Контакт" [ref=f3e169] [cursor=pointer]
+  - generic [ref=f3e170]:
+    - generic [ref=f3e171]: LIVE EXPERIMENT / 001
+    - button "↗ Встряхнуть песок" [ref=f3e172] [cursor=pointer]
+    - generic [ref=f3e173]: Идеи обретают форму. Попробуйте.
+  - paragraph [ref=f3e174]: Скролл или ← → — сменить раздел

@@ -1,0 +1,1610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Living Glass Aquarium</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#04101c;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none;outline:none}
+  #ui{position:fixed;left:50%;bottom:max(14px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;gap:8px;z-index:5}
+  #ui button{appearance:none;border:1px solid rgba(190,230,240,.22);background:rgba(8,26,40,.55);color:#cfe9ee;
+    font-size:12px;letter-spacing:.06em;padding:8px 14px;border-radius:999px;cursor:pointer;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+    transition:background .2s,border-color .2s}
+  #ui button:hover{background:rgba(20,60,80,.7);border-color:rgba(190,230,240,.45)}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="ui"><button id="btnReset" type="button">Reset view</button><button id="btnPause" type="button">Pause</button></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ============================================================
+   0. CONSTANTS & UTILITIES
+   ============================================================ */
+const TAU = Math.PI * 2;
+const TW = 8, TD = 4, TH = 5, GT = 0.09;          // tank outer size, glass thickness
+const IX = TW / 2 - GT, IZ = TD / 2 - GT;         // inner half extents
+const WL = 4.55;                                   // waterline
+const FILTER = { x: 3.15, z: -1.42 };
+const OUTLET = new THREE.Vector3(FILTER.x, 2.74, FILTER.z);
+const LAMP_Y = 6.35;
+const L_WATER = 1, L_GLASS = 2, L_EXT = 3;                   // render layers
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const rand = mulberry32(20261110);
+const rr = (a, b) => a + (b - a) * rand();
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+function hash2(x, y){ const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return n - Math.floor(n); }
+function hash3(x, y, z){ const n = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return n - Math.floor(n); }
+function vnoise(x, y){
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function vnoise3(x, y, z){
+  const zi = Math.floor(z), zf = z - zi, w = zf * zf * (3 - 2 * zf);
+  return lerp(vnoise(x + zi * 37.3, y + zi * 17.9), vnoise(x + (zi + 1) * 37.3, y + (zi + 1) * 17.9), w);
+}
+const fbm = (x, y) => vnoise(x, y) * .5 + vnoise(x * 2.1 + 5.2, y * 2.1 + 1.3) * .3 + vnoise(x * 4.3 + 9.1, y * 4.3 + 7.7) * .2;
+/** piecewise smooth profile through [[s,v],...] */
+function prof(pts){
+  return s => {
+    if (s <= pts[0][0]) return pts[0][1];
+    for (let i = 1; i < pts.length; i++) if (s <= pts[i][0]) {
+      const a = pts[i - 1], b = pts[i], t = (s - a[0]) / (b[0] - a[0]);
+      return lerp(a[1], b[1], t * t * (3 - 2 * t));
+    }
+    return pts[pts.length - 1][1];
+  };
+}
+const f = n => (Math.abs(n) < 1e-7 ? 0 : n).toFixed(5);
+const V3 = (x, y, z) => new THREE.Vector3(x, y, z);
+const _v1 = V3(), _v2 = V3(), _v3 = V3(), _q1 = new THREE.Quaternion(), _m1 = new THREE.Matrix4();
+
+/* ---------- substrate height (simplified collision surface) ---------- */
+const MOUNDS = [[-0.4,-0.85,1.5,.07],[-3.2,-1.35,.8,.09],[1.75,-1.2,.8,.07],[2.55,0.15,.8,.06],[-2.35,0.85,.7,.05],[3.1,-1.4,.7,.05]];
+function bedH(x, z){
+  const s = 0.5 - 0.5 * z / IZ;                      // 0 front → 1 back
+  let h = 0.33 + 0.22 * s * s + 0.10 * (fbm(x * 0.55 + 3, z * 0.55 + 8) - 0.5);
+  for (const m of MOUNDS){ const d2 = ((x - m[0]) ** 2 + (z - m[1]) ** 2) / (m[2] * m[2]); if (d2 < 4) h += m[3] * Math.exp(-d2 * 1.6); }
+  return h;
+}
+const CLIMB = [[1.05, 1.42, 0.24, 0.085], [2.45, 1.3, 0.2, 0.07]];   // flat stones snail A may climb: x,z,r,h
+function groundH(x, z){
+  let h = bedH(x, z);
+  for (const c of CLIMB){ const d = Math.hypot(x - c[0], z - c[1]) / c[2]; if (d < 1) h += c[3] * Math.sqrt(1 - d * d) ** 1.2; }
+  return h;
+}
+
+/* ---------- surface waves: one definition shared by JS + GLSL ---------- */
+const WAVES = [[1,.3,1.9,.016,.42,0],[-.6,1,1.25,.009,.33,1.7],[.4,-1,.8,.004,.27,3.1],[-1,-.5,.52,.0016,.21,.6],[.9,.9,.34,.0007,.17,4.4],[.2,1,.43,.0011,.19,2.2]]
+  .map(([dx, dz, len, amp, sp, ph]) => { const l = Math.hypot(dx, dz), k = TAU / len; return { kx: dx / l * k, kz: dz / l * k, amp, w: sp * k, ph }; });
+function waveH(x, z, t){ let h = 0; for (const w of WAVES) h += w.amp * Math.sin(w.kx * x + w.kz * z - w.w * t + w.ph); return h; }
+const wArg = w => `${f(w.kx)}*p.x+${f(w.kz)}*p.y-${f(w.w)}*t+${f(w.ph)}`;
+const GLSL_WAVES = `
+float waveH(vec2 p,float t){float h=0.;${WAVES.map(w => `h+=${f(w.amp)}*sin(${wArg(w)});`).join('')}return h;}
+vec2 waveG(vec2 p,float t){vec2 g=vec2(0.);${WAVES.map(w => `g+=${f(w.amp)}*cos(${wArg(w)})*vec2(${f(w.kx)},${f(w.kz)});`).join('')}return g;}
+vec3 waveHess(vec2 p,float t){vec3 H=vec3(0.);${WAVES.map(w => `H-=${f(w.amp)}*sin(${wArg(w)})*vec3(${f(w.kx * w.kx)},${f(w.kz * w.kz)},${f(w.kx * w.kz)});`).join('')}return H;}
+// light focusing under the animated surface: 1/|det(I - c*Hessian)| of the refracted light map
+float caustic(vec3 wp,float t){
+  float d=clamp(${f(WL)}-wp.y,0.,4.6);
+  vec2 p=wp.xz+0.10*sin(wp.zx*1.9+t*0.21)+0.05*wp.y;
+  vec3 H=waveHess(p,t)*(0.75*d+0.4);
+  float det=(1.-H.x)*(1.-H.y)-H.z*H.z;
+  float I=1./(abs(det)+0.22);
+  return clamp(I-1.,-0.4,2.6)*smoothstep(0.,.35,d);
+}`;
+const GLSL_ENV = `
+vec3 envBase(vec3 d){
+  vec3 c=mix(vec3(0.010,0.028,0.060),vec3(0.030,0.150,0.180),smoothstep(-0.75,0.95,d.y));
+  c+=vec3(0.30,0.42,0.50)*pow(max(dot(d,normalize(vec3(-0.55,0.55,0.62))),0.),5.)*0.55;
+  c+=vec3(0.20,0.34,0.36)*pow(max(dot(d,normalize(vec3(0.7,0.35,-0.6))),0.),4.)*0.35;
+  return c;
+}
+// environment with the lamp bar treated as a positioned area light (parallax-correct reflection)
+vec3 envLamp(vec3 pos,vec3 d){
+  vec3 c=envBase(d);
+  if(d.y>0.02){vec3 h=pos+d*((${f(LAMP_Y)}-pos.y)/d.y);
+    c+=vec3(1.,.97,.9)*5.*(1.-smoothstep(3.0,3.25,abs(h.x)))*(1.-smoothstep(0.14,0.26,abs(h.z)));}
+  return c;
+}`;
+/* ---------- shared current field (JS + GLSL mirror) ---------- */
+function currentAt(x, y, z, t, o){
+  let vx = .5 * Math.sin(.31 * t + y * .9 + z * .7) + .3 * Math.sin(.53 * t + x * .6 + 1.7);
+  let vz = .35 * Math.cos(.27 * t + x * .5 + y * .6) + .2 * Math.sin(.61 * t + z * 1.1);
+  let vy = .15 * Math.sin(.4 * t + x * .8 + z * .5);
+  const dx = x - FILTER.x, dz = z - FILTER.z, d2 = dx * dx + dz * dz;
+  vy += 1.6 * Math.exp(-d2 / .35) * smooth(2.2, 3.0, y);
+  const sp = .9 * Math.exp(-d2 / 2.5) * smooth(3.3, 4.4, y) / (Math.sqrt(d2) + .3);
+  return o.set(vx + dx * sp, vy, vz + dz * sp);
+}
+const GLSL_CURRENT = `
+vec3 currentAt(vec3 p,float t){
+  vec3 v=vec3(.5*sin(.31*t+p.y*.9+p.z*.7)+.3*sin(.53*t+p.x*.6+1.7), .15*sin(.4*t+p.x*.8+p.z*.5), .35*cos(.27*t+p.x*.5+p.y*.6)+.2*sin(.61*t+p.z*1.1));
+  vec2 dd=p.xz-vec2(${f(FILTER.x)},${f(FILTER.z)});float d2=dot(dd,dd);
+  v.y+=1.6*exp(-d2/.35)*smoothstep(2.2,3.0,p.y);
+  v.xz+=dd*(.9*exp(-d2/2.5)*smoothstep(3.3,4.4,p.y)/(sqrt(d2)+.3));
+  return v;
+}`;
+
+/* ============================================================
+   1. RENDERER, SCENE, CAMERA, CONTROLS
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 1.18;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.autoUpdate = false;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.5, 200);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.07;
+controls.minDistance = 4.4; controls.minPolarAngle = 0.2; controls.maxPolarAngle = 1.6;
+controls.rotateSpeed = 0.6; controls.zoomSpeed = 0.8; controls.panSpeed = 0.6;
+const VIEW_TARGET = V3(0, 2.55, 0), VIEW_DIR = V3(0.36, 0.3, 0.88).normalize();
+function fitDistance(){
+  const v = THREE.MathUtils.degToRad(camera.fov / 2), h = Math.atan(Math.tan(v) * camera.aspect);
+  return 5.1 / Math.sin(Math.min(v, h)) * (camera.aspect < 1 ? 1.0 : 0.86);
+}
+function resetView(){
+  const d = fitDistance();
+  controls.maxDistance = d * 1.7;
+  controls.target.copy(VIEW_TARGET);
+  camera.position.copy(VIEW_TARGET).addScaledVector(VIEW_DIR, d);
+  controls.update();
+}
+function constrainCamera(){                    // panning can never carry the view into the tank or pedestal
+  const t = controls.target;
+  t.x = clamp(t.x, -2.0, 2.0); t.y = clamp(t.y, 1.0, 4.0); t.z = clamp(t.z, -0.6, 0.6);
+}
+
+/* ---------- shared uniforms + material enhancer (caustics, hooks) ---------- */
+const shared = { uTime: { value: 0 }, uCaustic: { value: 0.5 } };
+function enhance(mat, o = {}){
+  const uni = Object.assign({}, shared, o.uniforms || {});
+  mat.userData.uni = uni;
+  const cs = o.caustic ?? 1;
+  mat.onBeforeCompile = sh => {
+    Object.assign(sh.uniforms, uni);
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `#include <common>\nvarying vec3 vWPos;varying vec3 vOPos;varying vec2 vUvC;uniform float uTime;\n${o.vertHead || ''}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\nvOPos=position;vUvC=uv;\n${o.vertBody || ''}`)
+      .replace('#include <project_vertex>', `#include <project_vertex>\n{vec4 wpC=vec4(transformed,1.0);\n#ifdef USE_INSTANCING\nwpC=instanceMatrix*wpC;\n#endif\nvWPos=(modelMatrix*wpC).xyz;}`);
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>\nvarying vec3 vWPos;varying vec3 vOPos;varying vec2 vUvC;uniform float uTime;uniform float uCaustic;\n${GLSL_WAVES}\n${o.fragHead || ''}`)
+      .replace('#include <color_fragment>', `#include <color_fragment>\n${o.fragColor || ''}`)
+      .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+{float cm=step(vWPos.y,${f(WL)})*${f(cs)};vec3 nW=inverseTransformDirection(normal,viewMatrix);
+ reflectedLight.directDiffuse+=diffuseColor.rgb*vec3(1.,.97,.9)*caustic(vWPos,uTime)*cm*clamp(nW.y*.6+.55,.12,1.)*uCaustic;
+ ${o.fragLight || ''}}`);
+  };
+  mat.customProgramCacheKey = () => (o.key || 'base') + '|' + cs;
+  return mat;
+}
+/** canvas helper for runtime-generated surface patterns */
+function makeCanvasTex(w, h, draw, srgb = true){
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4;
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function shadowed(o, cast = true, recv = true){ o.traverse(m => { if (m.isMesh){ m.castShadow = cast; m.receiveShadow = recv; } }); return o; }
+
+/* ============================================================
+   2. STAGE 1 — AQUARIUM, PEDESTAL, BACKDROP, LIGHTING
+   ============================================================ */
+function createBackdrop(){
+  const g = new THREE.Group(); g.name = 'Backdrop';
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(90, 32, 16), new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    vertexShader: `varying vec3 vD;void main(){vD=position;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+    fragmentShader: `varying vec3 vD;${GLSL_ENV}
+      void main(){gl_FragColor=vec4(envBase(normalize(vD)),1.);
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+      }` }));
+  sky.frustumCulled = false; g.add(sky);
+  const fl = new THREE.Mesh(new THREE.PlaneGeometry(44, 44), new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, color: 0x000000,
+    alphaMap: makeCanvasTex(256, 256, (c, w, h) => { const gr = c.createRadialGradient(w / 2, h / 2, 10, w / 2, h / 2, w / 2);
+      gr.addColorStop(0, '#9a9a9a'); gr.addColorStop(.35, '#555'); gr.addColorStop(1, '#000'); c.fillStyle = gr; c.fillRect(0, 0, w, h); }, false) }));
+  fl.rotation.x = -Math.PI / 2; fl.position.y = -3.6; g.add(fl);
+  return g;
+}
+function glassMaterial(thin){
+  return new THREE.ShaderMaterial({
+    transparent: true, premultipliedAlpha: true, depthWrite: false, uniforms: { uThin: { value: thin } },
+    vertexShader: `varying vec3 vW;varying vec3 vN;varying vec3 vON;
+      void main(){vON=normal;vec4 w=modelMatrix*vec4(position,1.);vW=w.xyz;vN=normalize(mat3(modelMatrix)*normal);gl_Position=projectionMatrix*viewMatrix*w;}`,
+    fragmentShader: `uniform vec3 uThin;varying vec3 vW;varying vec3 vN;varying vec3 vON;${GLSL_ENV}
+      float grimeHash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+      float grimeNoise(vec2 p){
+        vec2 i=floor(p),a=fract(p);a=a*a*(3.-2.*a);
+        return mix(mix(grimeHash(i),grimeHash(i+vec2(1.,0.)),a.x),
+                   mix(grimeHash(i+vec2(0.,1.)),grimeHash(i+vec2(1.)),a.x),a.y);
+      }
+      void main(){
+        vec3 V=normalize(vW-cameraPosition);vec3 N=normalize(vN);
+        float c=max(dot(-V,N),0.);float F=0.04+0.96*pow(1.-c,5.);          // Schlick, IOR 1.5
+        vec3 refl=envLamp(vW,reflect(V,N));
+        float edge=1.-step(0.5,abs(dot(vON,uThin)));                         // pane thickness faces
+        vec3 tint=mix(vec3(0.50,0.80,0.76),vec3(0.10,0.34,0.29),edge);
+        float ta=mix(0.03,0.62,edge);
+        float streak=edge*pow(max(dot(reflect(V,N),normalize(vec3(0.1,0.9,0.3))),0.),8.)*0.6;
+        vec3 col=refl*F*mix(0.9,0.5,edge)+tint*ta*(0.55+0.45*N.y)+vec3(0.7,1.,0.95)*streak;
+        // Static, world-anchored deposits on each pane, strongest near the gravel.
+        vec2 paneUV=vec2(abs(uThin.x)>.5?vW.z:vW.x,vW.y);
+        float patches=grimeNoise(paneUV*5.3)*.65+grimeNoise(paneUV*17.)*.35;
+        float submerged=1.-smoothstep(${f(WL-.04)},${f(WL+.03)},vW.y);
+        float bottom=1.-smoothstep(.45,1.35,vW.y);
+        float algae=smoothstep(.40,.76,patches)*bottom*submerged*.32;
+        float film=smoothstep(.48,.8,patches)*submerged*.045;
+        float ring=exp(-pow((vW.y-${f(WL+.025)}+(.5-grimeNoise(paneUV*8.))*.025)/.035,2.));
+        float mineral=ring*(.045+.10*grimeNoise(paneUV*32.));
+        float drip=pow(grimeNoise(vec2(paneUV.x*38.,paneUV.y*.7)),12.)*.065;
+        drip*=smoothstep(${f(WL-.4)},${f(WL)},vW.y);
+        float dirt=clamp((algae+film+mineral+drip)*(1.-edge),0.,.4);
+        vec3 deposit=mix(vec3(.16,.24,.075),vec3(.65,.61,.45),
+                         clamp((mineral+drip)/max(dirt,.001),0.,1.));
+        col=col*(1.-dirt)+deposit*dirt;
+        float alpha=clamp(F+ta,0.,1.);
+        gl_FragColor=vec4(col,alpha+dirt*(1.-alpha));
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }` });
+}
+function createAquarium(){
+  const g = new THREE.Group(); g.name = 'Aquarium';
+  const pane = (w, h, d, x, y, z, thin) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), glassMaterial(thin));
+    m.position.set(x, y, z); m.layers.set(L_GLASS); m.renderOrder = 10; g.add(m); return m; };
+  pane(TW, TH, GT, 0, TH / 2, TD / 2 - GT / 2, V3(0, 0, 1)).name = 'GlassFront';
+  pane(TW, TH, GT, 0, TH / 2, -TD / 2 + GT / 2, V3(0, 0, 1)).name = 'GlassBack';
+  pane(GT, TH, TD - 2 * GT, -TW / 2 + GT / 2, TH / 2, 0, V3(1, 0, 0)).name = 'GlassLeft';
+  pane(GT, TH, TD - 2 * GT, TW / 2 - GT / 2, TH / 2, 0, V3(1, 0, 0)).name = 'GlassRight';
+  pane(TW - 2 * GT, GT, TD - 2 * GT, 0, GT / 2, 0, V3(0, 1, 0)).name = 'GlassBottom';
+  // silicone seams in the inner vertical corners
+  const seamM = new THREE.MeshStandardMaterial({ color: 0xbfcfcf, roughness: .45, transparent: true, opacity: .32 });
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]){
+    const s = new THREE.Mesh(new THREE.BoxGeometry(.034, TH - GT - .06, .034), seamM); s.position.set(sx * (IX - .014), (TH + GT) / 2 - .03, sz * (IZ - .014)); g.add(s); }
+  // matte-black bottom frame and narrow rim
+  const black = new THREE.MeshStandardMaterial({ color: 0x060607, roughness: .92, metalness: 0, envMapIntensity: .25 });
+  const bar = (w, h, d, x, y, z) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), black); m.position.set(x, y, z); m.layers.set(L_EXT); g.add(m); return m; };
+  bar(TW + .12, .1, TD + .12, 0, -.05, 0);
+  for (const s of [-1, 1]){
+    bar(TW + .12, .2, .06, 0, .1, s * (TD / 2 + .03)); bar(.06, .2, TD + .12, s * (TW / 2 + .03), .1, 0);
+    bar(TW + .08, .07, GT + .08, 0, TH - .01, s * (TD / 2 - GT / 2)); bar(GT + .08, .07, TD - 2 * GT - .08, s * (TW / 2 - GT / 2), TH - .01, 0);
+  }
+  return g;
+}
+function createPedestal(){
+  const g = new THREE.Group(); g.name = 'Pedestal';
+  const m = new THREE.MeshStandardMaterial({ color: 0x0c0e11, roughness: .8, metalness: 0, envMapIntensity: .35 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(8.9, 3.4, 4.9), m); body.position.y = -1.92; body.receiveShadow = true;
+  const top = new THREE.Mesh(new THREE.BoxGeometry(9.2, .12, 5.2), new THREE.MeshStandardMaterial({ color: 0x0e1114, roughness: .7, metalness: 0, envMapIntensity: .4 }));
+  top.position.y = -.16; top.receiveShadow = true;
+  const cs = new THREE.Mesh(new THREE.PlaneGeometry(9.2, 5.2), new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, color: 0x000000, opacity: .75,
+    alphaMap: makeCanvasTex(256, 144, (c, w, h) => { c.fillStyle = '#000'; c.fillRect(0, 0, w, h); c.shadowColor = '#fff'; c.shadowBlur = 14; c.fillStyle = '#fff';
+      c.fillRect(w * .055, h * .08, w * .89, h * .84); }, false) }));
+  cs.rotation.x = -Math.PI / 2; cs.position.y = -.097;
+  g.add(body, top, cs); return g;
+}
+function createLamp(){
+  const g = new THREE.Group(); g.name = 'AquariumLight';
+  const m = new THREE.MeshStandardMaterial({ color: 0x070708, roughness: .85, metalness: 0, envMapIntensity: .3 });
+  const add = (w, h, d, x, y, z, mat = m) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat); b.position.set(x, y, z); b.layers.set(L_EXT); g.add(b); return b; };
+  add(6.6, .1, .52, 0, LAMP_Y + .05, 0);
+  add(6.36, .012, .36, 0, LAMP_Y - .004, 0, new THREE.MeshBasicMaterial({ color: new THREE.Color(2.6, 2.5, 2.3) }));
+  for (const sx of [-1, 1]){
+    add(.05, .05, TD - .04, sx * 3.1, LAMP_Y + .05, 0);
+    for (const sz of [-1, 1]) add(.04, LAMP_Y - TH + .05, .04, sx * 3.1, (LAMP_Y + TH) / 2 + .03, sz * (TD / 2 - .045));
+  }
+  return g;
+}
+function createLights(){
+  const g = new THREE.Group(); g.name = 'Lights';
+  const key = new THREE.DirectionalLight(0xfff1dc, 2.25); key.position.set(.9, 12, 1.6); key.castShadow = true;
+  key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; key.shadow.normalBias = 0.018; key.shadow.radius = 3.5;
+  Object.assign(key.shadow.camera, { left: -5.2, right: 5.2, top: 3.4, bottom: -3.4, near: 2, far: 18 });
+  const fill = new THREE.DirectionalLight(0xb4d6e6, .3); fill.position.set(-6, 4.5, 9);
+  const back = new THREE.DirectionalLight(0x7fd0c8, .22); back.position.set(5, 3, -8);
+  g.add(key, key.target, fill, back, new THREE.HemisphereLight(0xcfe3e6, 0x1c2426, .34));
+  return g;
+}
+function buildEnvironment(){                         // procedural studio environment → PMREM
+  const es = new THREE.Scene();
+  const sg = new THREE.SphereGeometry(30, 32, 16), col = [], p = sg.attributes.position;
+  for (let i = 0; i < p.count; i++){ const t = smooth(-.7, .9, p.getY(i) / 30); col.push(lerp(.03, .11, t), lerp(.05, .2, t), lerp(.08, .24, t)); }
+  sg.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  es.add(new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+  const panel = (w, h, x, y, z, r, g2, b) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(r, g2, b), side: THREE.DoubleSide }));
+    m.position.set(x, y, z); m.lookAt(0, 0, 0); es.add(m); };
+  panel(16, 4, 0, 14, 0, 9, 8.6, 7.8); panel(12, 9, -16, 7, 12, 1.3, 1.8, 2.2); panel(10, 8, 17, 5, -9, .6, 1.2, 1.2);
+  const pm = new THREE.PMREMGenerator(renderer);
+  scene.environment = pm.fromScene(es, 0.035).texture; scene.environmentIntensity = 0.5; pm.dispose();
+}
+scene.add(createBackdrop(), createAquarium(), createPedestal(), createLamp(), createLights());
+buildEnvironment();
+
+/* ============================================================
+   3. STAGE 2 — WATER: SURFACE WAVES, REFRACTION, RIPPLES
+   ============================================================ */
+const WX = IX - 0.004, WZ = IZ - 0.004, WB = GT + 0.002;
+const MAXRIP = 8;
+const ripples = Array.from({ length: MAXRIP }, () => new THREE.Vector4(0, 0, -100, 0));
+function addRipple(x, z, t, strength){
+  let oldest = 0;
+  for (let i = 0; i < MAXRIP; i++){
+    const r = ripples[i];
+    if (t - r.z < 0.3 && Math.hypot(x - r.x, z - r.y) < 0.3){ r.w = Math.min(r.w + strength * .5, 2.2); return; }   // aggregate nearby arrivals
+    if (r.z < ripples[oldest].z) oldest = i;
+  }
+  ripples[oldest].set(x, z, t, strength);
+}
+const GLSL_RIPPLE = `
+uniform vec4 uRip[${MAXRIP}];
+float rippleH(vec2 p,float t){float h=0.;
+  for(int i=0;i<${MAXRIP};i++){float age=t-uRip[i].z;if(age<0.||age>3.)continue;
+    float r=distance(p,uRip[i].xy),fr=0.5*age+0.03,x=r-fr;
+    h+=0.011*uRip[i].w*exp(-age*1.5)*sin(x*30.)*exp(-x*x*30.)/(1.+r*1.2);}
+  return h;}`;
+const sceneRT = new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4, depthTexture: new THREE.DepthTexture(4, 4) });
+const waterUni = { uTime: shared.uTime, uRip: { value: ripples }, tScene: { value: sceneRT.texture }, tDepth: { value: sceneRT.depthTexture },
+  uRes: { value: new THREE.Vector2(4, 4) }, uProj: { value: camera.projectionMatrix }, uProjInv: { value: camera.projectionMatrixInverse } };
+
+/** water box: animated top + four side interfaces. kind 0 = top, 1 = side; top vertices follow the waves */
+function waterBoxGeometry(inward){
+  const pos = [], nrm = [], kind = [], top = [], idx = [];
+  const quadStrip = (n, pt, normal, k) => {           // pt(i,j) -> [x,y,z,isTop]
+    const base = pos.length / 3;
+    for (let j = 0; j <= n[1]; j++) for (let i = 0; i <= n[0]; i++){ const p = pt(i / n[0], j / n[1]); pos.push(p[0], p[1], p[2]); nrm.push(...normal); kind.push(k); top.push(p[3]); }
+    for (let j = 0; j < n[1]; j++) for (let i = 0; i < n[0]; i++){ const a = base + j * (n[0] + 1) + i, b = a + 1, c = a + n[0] + 1, d = c + 1; idx.push(a, c, b, b, c, d); }
+  };
+  const s = inward ? -1 : 1;
+  quadStrip([128, 64], (u, v) => [lerp(-WX, WX, u), WL, lerp(-WZ, WZ, inward ? 1 - v : v), 1], [0, s, 0], 0);
+  const side = (ax, sign) => quadStrip([96, 1], (u, v) => { const a = lerp(-1, 1, (sign * s > 0) === (ax === 'x') ? u : 1 - u);
+    return ax === 'z' ? [a * WX, v ? WL : WB, sign * WZ, v] : [sign * WX, v ? WL : WB, a * WZ, v]; }, ax === 'z' ? [0, 0, sign * s] : [sign * s, 0, 0], 1);
+  side('z', 1); side('z', -1); side('x', 1); side('x', -1);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  g.setAttribute('aKind', new THREE.Float32BufferAttribute(kind, 1)); g.setAttribute('aTop', new THREE.Float32BufferAttribute(top, 1));
+  g.setIndex(idx); return g;
+}
+const WATER_VERT = `attribute float aKind;attribute float aTop;uniform float uTime;varying vec3 vW;varying vec3 vNrm;varying float vKind;varying float vViewZ;
+  ${GLSL_WAVES}${GLSL_RIPPLE}
+  void main(){vec3 p=position;if(aTop>.5)p.y+=waveH(p.xz,uTime)+rippleH(p.xz,uTime);
+    vW=p;vNrm=normal;vKind=aKind;vec4 mv=viewMatrix*vec4(p,1.);vViewZ=-mv.z;gl_Position=projectionMatrix*mv;}`;
+const GLSL_SURFN = `
+vec3 surfaceNormal(vec2 p,float t){
+  vec2 g=waveG(p,t);float e=0.012;float h0=rippleH(p,t);
+  g+=vec2(rippleH(p+vec2(e,0.),t)-h0,rippleH(p+vec2(0.,e),t)-h0)/e;
+  vec2 dw=vec2(${f(WX)},${f(WZ)})-abs(p);                                   // meniscus: surface climbs the glass
+  g+=sign(p)*vec2(exp(-dw.x*55.),exp(-dw.y*55.))*1.3;
+  return normalize(vec3(-g.x,1.,-g.y));}`;
+function createWater(){
+  const g = new THREE.Group(); g.name = 'Water';
+  const outer = new THREE.Mesh(waterBoxGeometry(false), new THREE.ShaderMaterial({
+    uniforms: waterUni, vertexShader: WATER_VERT,
+    fragmentShader: `uniform sampler2D tScene;uniform sampler2D tDepth;uniform vec2 uRes;uniform mat4 uProj;uniform mat4 uProjInv;uniform float uTime;
+      varying vec3 vW;varying vec3 vNrm;varying float vKind;varying float vViewZ;
+      ${GLSL_WAVES}${GLSL_RIPPLE}${GLSL_SURFN}${GLSL_ENV}
+      float viewDepth(vec2 uv){float z=texture2D(tDepth,uv).x;vec4 c=uProjInv*vec4(uv*2.-1.,z*2.-1.,1.);return -c.z/c.w;}
+      vec2 toScreen(vec3 wp){vec4 c=uProj*viewMatrix*vec4(wp,1.);return c.xy/c.w*.5+.5;}
+      void main(){
+        vec2 suv=gl_FragCoord.xy/uRes;
+        vec3 V=normalize(vW-cameraPosition);
+        bool top=vKind<.5;
+        vec3 Nf=normalize(vNrm);
+        vec3 N=top?surfaceNormal(vW.xz,uTime):Nf;
+        float dS=vViewZ;
+        // Bounded optical distortion; reject all colour samples across silhouettes.
+        vec2 ruv=suv;
+        float baseDepth=viewDepth(suv);
+        float tolerance=max(.035,baseDepth*.003);
+        vec2 bend=vec2(0.);
+        if(top){
+          vec3 flatRay=refract(V,Nf,1./1.333);
+          vec3 waveRay=refract(V,N,1./1.333);
+          float travel=clamp((baseDepth-dS)*.35,0.,1.2);
+          bend=toScreen(vW+waveRay*travel)-toScreen(vW+flatRay*travel);
+          bend=clamp(bend,vec2(-.008),vec2(.008));
+          float border=min(min(suv.x,suv.y),min(1.-suv.x,1.-suv.y));
+          bend*=smoothstep(0.,.04,border);
+          vec2 candidate=clamp(suv+bend,vec2(.001),vec2(.999));
+          float delta=abs(viewDepth(candidate)-baseDepth);
+          float continuity=1.-smoothstep(tolerance*.25,tolerance,delta);
+          if(viewDepth(candidate)>dS)ruv=suv+bend*continuity;
+        }
+        float dR=viewDepth(ruv);
+        vec3 col=texture2D(tScene,ruv).rgb;
+        if(top){
+          vec2 split=(ruv-suv)*.055;
+          vec2 redUV=clamp(ruv+split,vec2(.001),vec2(.999));
+          vec2 blueUV=clamp(ruv-split,vec2(.001),vec2(.999));
+          if(abs(viewDepth(redUV)-baseDepth)<tolerance && abs(viewDepth(blueUV)-baseDepth)<tolerance){
+            col.r=texture2D(tScene,redUV).r;
+            col.b=texture2D(tScene,blueUV).b;
+          }
+        }
+        float path=clamp(dR-dS,0.,10.);
+        col=col*exp(-vec3(.05,.014,.009)*path)+vec3(.010,.07,.085)*(1.-exp(-.05*path));     // depth-dependent absorption
+        if(top){
+          float c=max(dot(-V,N),0.);float F=.02+.98*pow(1.-c,5.);
+          col=mix(col,envLamp(vW,reflect(V,N)),F);
+          vec3 lampDir=normalize(vec3(-.35,1.,.25));
+          vec3 halfVector=normalize(lampDir-V);
+          float glint=pow(max(dot(N,halfVector),0.),180.);
+          col+=vec3(1.,.89,.65)*glint*.7;
+          vec2 dw=vec2(${f(WX)},${f(WZ)})-abs(vW.xz);float edge=exp(-min(dw.x,dw.y)*60.);
+          col+=vec3(.5,.75,.78)*edge*.10;
+        }else{
+          float line=1.-smoothstep(0.,.045,${f(WL)}+waveH(vW.xz,uTime)-vW.y);                    // thin moving waterline
+          col=mix(col,col*.55+vec3(.42,.62,.66)*.3,line*.75);
+        }
+        gl_FragColor=vec4(col,1.);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }` }));
+  outer.name = 'WaterInterfaces'; outer.layers.set(L_WATER); outer.frustumCulled = false;
+  // faces seen from inside the water (captured in the refraction pass): mirror-like underside + faint wall reflections
+  const inner = new THREE.Mesh(waterBoxGeometry(true), new THREE.ShaderMaterial({
+    uniforms: waterUni, vertexShader: WATER_VERT, transparent: true, depthWrite: false,
+    fragmentShader: `uniform float uTime;varying vec3 vW;varying vec3 vNrm;varying float vKind;
+      ${GLSL_WAVES}${GLSL_RIPPLE}${GLSL_SURFN}${GLSL_ENV}
+      void main(){
+        vec3 V=normalize(vW-cameraPosition);vec3 col;float a;
+        if(vKind<.5){vec3 N=-surfaceNormal(vW.xz,uTime);
+          vec3 T=refract(V,N,1.333);float c=max(dot(-V,N),0.);
+          float F=dot(T,T)<.5?1.:.02+.98*pow(1.-c,5.);                        // total internal reflection past ~49°
+          vec3 mir=vec3(.035,.15,.17)*(.75+3.*abs(N.x)+3.*abs(N.z));
+          col=mix(envLamp(vW,T)*.9+vec3(.08,.2,.22),mir,F);a=1.;
+        }else{float c=max(dot(-V,normalize(vNrm)),0.);
+          a=mix(.42,.03,smoothstep(0.,.7,c));col=vec3(.02,.105,.125);}
+        gl_FragColor=vec4(col,a);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }` }));
+  inner.name = 'WaterInnerFaces'; inner.frustumCulled = false; inner.renderOrder = -1;
+  g.add(outer, inner); return g;
+}
+scene.add(createWater());
+
+/* ============================================================
+   4. STAGE 4 — PEBBLE BED   (+ collision registry)
+   ============================================================ */
+const GLSL_NOISE = `
+float h31(vec3 p){p=fract(p*.3183099+.1);p*=17.;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float n3(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.-2.*f);
+  return mix(mix(mix(h31(i),h31(i+vec3(1,0,0)),f.x),mix(h31(i+vec3(0,1,0)),h31(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(h31(i+vec3(0,0,1)),h31(i+vec3(1,0,1)),f.x),mix(h31(i+vec3(0,1,1)),h31(i+vec3(1,1,1)),f.x),f.y),f.z);}`;
+/** vertical-cylinder colliders {x,z,r,top}; fish use all of them, bottom animals use those flagged ground */
+const OBST = [];
+const addObst = (x, z, r, top, ground = true, fish = true) => OBST.push({ x, z, r, top, ground, fish });
+const PEB_COLORS = [[.76,.66,.50,5],[.44,.48,.52,4],[.17,.18,.19,2.5],[.42,.30,.20,3],[.87,.85,.78,1.3],[.60,.52,.42,3]];
+function pebbleColor(c){
+  let tot = 0; for (const p of PEB_COLORS) tot += p[3];
+  let r = rand() * tot; for (const p of PEB_COLORS){ r -= p[3]; if (r <= 0){ const j = rr(.86, 1.12); return c.setRGB(p[0] * j, p[1] * j * rr(.97, 1.03), p[2] * j); } }
+  return c.setRGB(.5, .5, .5);
+}
+function stoneGeometry(seed, rough = .28, ws = 12, hs = 8){
+  const g = new THREE.SphereGeometry(1, ws, hs), p = g.attributes.position;
+  for (let i = 0; i < p.count; i++){
+    _v1.fromBufferAttribute(p, i).normalize();
+    const r = 1 + rough * (vnoise3(_v1.x * 1.6 + seed, _v1.y * 1.6 + seed * 2.3, _v1.z * 1.6 + 7) - .5) * 2 + rough * .35 * (vnoise3(_v1.x * 4 + seed, _v1.y * 4, _v1.z * 4) - .5);
+    p.setXYZ(i, _v1.x * r, _v1.y * r, _v1.z * r);
+  }
+  g.computeVertexNormals(); return g;
+}
+function stoneMaterial(extra = {}){
+  return enhance(new THREE.MeshStandardMaterial({ roughness: .86, metalness: 0, ...extra }), { key: 'stone', fragHead: GLSL_NOISE,
+    fragColor: `diffuseColor.rgb*=.78+.42*n3(vOPos*5.5)*n3(vOPos*17.+3.)*1.6;` });
+}
+function createSubstrate(){
+  const g = new THREE.Group(); g.name = 'PebbleBed';
+  // continuous shallow gravel layer with skirts down to the glass floor
+  const NX = 130, NZ = 64, pos = [], uv = [], idx = [];
+  for (let j = 0; j <= NZ; j++) for (let i = 0; i <= NX; i++){
+    const x = lerp(-IX, IX, i / NX), z = lerp(-IZ, IZ, j / NZ);
+    pos.push(x, bedH(x, z) + .014 * (hash2(i * 1.3, j * 2.1) - .5), z); uv.push(x / 1.5, z / 1.5);
+  }
+  for (let j = 0; j < NZ; j++) for (let i = 0; i < NX; i++){ const a = j * (NX + 1) + i, b = a + 1, c = a + NX + 1, d = c + 1; idx.push(a, c, b, b, c, d); }
+  const top = new THREE.BufferGeometry();
+  top.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); top.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2)); top.setIndex(idx); top.computeVertexNormals();
+  const skirts = [];
+  const skirt = (fn, n, N) => { const p = [], u = [], nn = [], ix = [];
+    for (let i = 0; i <= N; i++){ const [x, z] = fn(i / N), h = bedH(x, z); p.push(x, h, z, x, GT, z); u.push(i / N * 5, h / 1.5, i / N * 5, 0); nn.push(...n, ...n); }
+    for (let i = 0; i < N; i++){ const a = i * 2; ix.push(a, a + 1, a + 2, a + 2, a + 1, a + 3); }
+    const sg = new THREE.BufferGeometry(); sg.setAttribute('position', new THREE.Float32BufferAttribute(p, 3)); sg.setAttribute('uv', new THREE.Float32BufferAttribute(u, 2));
+    sg.setAttribute('normal', new THREE.Float32BufferAttribute(nn, 3)); sg.setIndex(ix); skirts.push(sg); };
+  skirt(t => [lerp(-IX, IX, t), IZ], [0, 0, 1], NX); skirt(t => [lerp(IX, -IX, t), -IZ], [0, 0, -1], NX);
+  skirt(t => [IX, lerp(IZ, -IZ, t)], [1, 0, 0], NZ); skirt(t => [-IX, lerp(-IZ, IZ, t)], [-1, 0, 0], NZ);
+  const gravel = makeCanvasTex(512, 512, (c, w, h) => {
+    c.fillStyle = '#3a342c'; c.fillRect(0, 0, w, h); const col = new THREE.Color();
+    for (let i = 0; i < 5200; i++){ pebbleColor(col); const k = rr(.55, .95); c.fillStyle = `rgb(${col.r * 255 * k | 0},${col.g * 255 * k | 0},${col.b * 255 * k | 0})`;
+      const x = rand() * w, y = rand() * h, a = rr(2.5, 7), b = a * rr(.6, 1), r = rand() * 3.14;
+      for (const ox of [0, w, -w]) for (const oy of [0, h, -h]){ c.beginPath(); c.ellipse(x + ox, y + oy, a, b, r, 0, TAU); c.fill(); } }
+  });
+  const bedMat = enhance(new THREE.MeshStandardMaterial({ map: gravel, bumpMap: gravel, bumpScale: 2.5, roughness: .95, side: THREE.DoubleSide }), { key: 'bed' });
+  const bed = new THREE.Mesh(mergeGeometries([top, ...skirts]), bedMat); bed.receiveShadow = true; bed.name = 'GravelLayer'; g.add(bed);
+  // instanced pebbles
+  const shapes = [stoneGeometry(1.3), stoneGeometry(5.7, .36), stoneGeometry(9.1, .2), stoneGeometry(14.4, .3)];
+  const PER = 175, dummy = new THREE.Object3D(), col = new THREE.Color(), mat = stoneMaterial();
+  shapes.forEach((sg, si) => {
+    const im = new THREE.InstancedMesh(sg, mat, PER); im.name = 'Pebbles' + si; im.castShadow = im.receiveShadow = true;
+    let n = 0, guard = 0;
+    while (n < PER && guard++ < 5000){
+      const front = rand() < .12, x = rr(-IX + .07, IX - .07), z = front ? rr(IZ - .16, IZ - .06) : rr(-IZ + .07, IZ - .07);
+      if (Math.hypot(x - FILTER.x, z - FILTER.z) < .36) continue;
+      if (CLIMB.some(c => Math.hypot(x - c[0], z - c[1]) < c[2] + .05)) continue;
+      const s = rand() < .08 ? rr(.095, .125) : rr(.04, .085);
+      dummy.position.set(x, bedH(x, z) + s * .22, z);
+      dummy.scale.set(s * rr(.85, 1.35), s * rr(.45, .78), s * rr(.85, 1.35));
+      dummy.rotation.set(rr(-.25, .25), rand() * TAU, rr(-.25, .25)); dummy.updateMatrix();
+      im.setMatrixAt(n, dummy.matrix); im.setColorAt(n, pebbleColor(col)); n++;
+    }
+    im.count = n; g.add(im);
+  });
+  // larger accent stones (obstacles) and two flat climbable stones for the bottom snail
+  const ACCENT = [[1.35, -.12, .3, .62, .5, .47, .44], [-1.5, 1.1, .22, .7, .33, .3, .28], [3.4, .8, .3, .6, .62, .56, .47], [1.95, -.4, .21, .75, .22, .23, .25], [-3.4, .15, .27, .65, .52, .5, .48]];
+  ACCENT.forEach((a, i) => {
+    const m = new THREE.Mesh(stoneGeometry(20 + i * 3.1, .22, 20, 14), stoneMaterial({ color: new THREE.Color(a[4], a[5], a[6]) }));
+    m.scale.set(a[2] * rr(1, 1.2), a[2] * a[3], a[2]); m.rotation.y = rand() * TAU; m.position.set(a[0], bedH(a[0], a[1]) + a[2] * a[3] * .45, a[1]);
+    m.castShadow = m.receiveShadow = true; m.name = 'AccentStone' + i; g.add(m); addObst(a[0], a[1], a[2] * 1.1, bedH(a[0], a[1]) + a[2] * a[3] * 1.5);
+  });
+  CLIMB.forEach((c, i) => {
+    const m = new THREE.Mesh(stoneGeometry(40 + i * 5, .05, 22, 14), stoneMaterial({ color: i ? 0x6c665c : 0x8a7f6c }));
+    m.scale.set(c[2] * 1.02, c[3] * 1.0, c[2] * 1.02); m.position.set(c[0], bedH(c[0], c[1]) + .004, c[1]);
+    m.castShadow = m.receiveShadow = true; m.name = 'FlatStone' + i; g.add(m);
+  });
+  return g;
+}
+scene.add(createSubstrate());
+
+/* ============================================================
+   5. STAGE 3 — SPONGE FILTER + BUBBLE PLUME
+   ============================================================ */
+function createFilter(){
+  const g = new THREE.Group(); g.name = 'SpongeFilter';
+  const by = bedH(FILTER.x, FILTER.z) - .02;
+  const porous = makeCanvasTex(256, 256, (c, w, h) => { c.fillStyle = '#777'; c.fillRect(0, 0, w, h);
+    for (let i = 0; i < 4200; i++){ const v = rand() < .7 ? rr(0, 70) : rr(150, 230); c.fillStyle = `rgb(${v | 0},${v | 0},${v | 0})`; c.beginPath(); c.arc(rand() * w, rand() * h, rr(.8, 2.6), 0, TAU); c.fill(); } }, false);
+  porous.repeat.set(4, 2);
+  const plastic = enhance(new THREE.MeshStandardMaterial({ color: 0x0e0f12, roughness: .34, metalness: .05 }), { key: 'plastic', caustic: .5 });
+  const sponge = enhance(new THREE.MeshStandardMaterial({ color: 0x141416, roughness: 1, bumpMap: porous, bumpScale: 3 }), { key: 'sponge', caustic: .6 });
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(.3, .34, .12, 28), plastic); base.position.y = by + .06;
+  const pts = []; for (let i = 0; i <= 64; i++){ const t = i / 64, y = t * .86; const groove = Math.pow(Math.abs(Math.sin(t * Math.PI * 7)), .6);
+    pts.push(new THREE.Vector2((.1 + .05 * groove) * smooth(0, .04, t) * smooth(1, .96, t) + .13, y)); }
+  const sp = new THREE.Mesh(new THREE.LatheGeometry(pts, 36), sponge); sp.position.y = by + .11;
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(.17, .22, .08, 24), plastic); cap.position.y = by + 1.0;
+  const tubeH = OUTLET.y - .1 - (by + 1.0);
+  const tube = new THREE.Mesh(new THREE.CylinderGeometry(.075, .075, tubeH, 20), plastic); tube.position.y = by + 1.0 + tubeH / 2;
+  const fl = [[.075, 0], [.08, .03], [.1, .075], [.125, .1]].map(p => new THREE.Vector2(p[0], p[1]));
+  const flareM = enhance(new THREE.MeshStandardMaterial({ color: 0x15171b, roughness: .3, side: THREE.DoubleSide }), { key: 'plastic2', caustic: .5 });
+  const flare = new THREE.Mesh(new THREE.LatheGeometry(fl, 24), flareM); flare.position.y = OUTLET.y - .1;
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(.125, .014, 8, 28), new THREE.MeshStandardMaterial({ color: 0x3a3f46, roughness: .3 })); rim.rotation.x = Math.PI / 2; rim.position.y = OUTLET.y;
+  const body = new THREE.Group(); body.add(base, sp, cap, tube, flare, rim); body.position.set(FILTER.x, 0, FILTER.z); g.add(body);
+  // brackets + suction cups against the rear pane
+  const cupM = new THREE.MeshStandardMaterial({ color: 0x40504f, roughness: .25, transparent: true, opacity: .72 });
+  for (const y of [by + 1.35, 2.25]){
+    const len = IZ + FILTER.z;
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(.04, .035, len), plastic); arm.position.set(FILTER.x, y, FILTER.z - len / 2);
+    const clip = new THREE.Mesh(new THREE.TorusGeometry(.088, .017, 8, 20), plastic); clip.rotation.x = Math.PI / 2; clip.position.set(FILTER.x, y, FILTER.z);
+    const cup = new THREE.Mesh(new THREE.CylinderGeometry(.085, .03, .05, 20), cupM); cup.rotation.x = Math.PI / 2; cup.position.set(FILTER.x, y, -IZ + .026);
+    g.add(arm, clip, cup);
+  }
+  // airline hose: enters the lift tube base, climbs the rear corner and leaves over the rim
+  const hx = IX - .1, curve = new THREE.CatmullRomCurve3([V3(FILTER.x + .07, by + 1.12, FILTER.z), V3(FILTER.x + .22, by + 1.22, FILTER.z - .08), V3(FILTER.x + .4, by + 1.6, FILTER.z - .3),
+    V3(hx, 2.4, -IZ + .06), V3(hx, 4.2, -IZ + .05), V3(hx, 4.95, -IZ + .04), V3(hx, 5.1, -TD / 2 + .04), V3(hx, 5.02, -TD / 2 - .07), V3(hx, 4.2, -TD / 2 - .1), V3(hx + .05, 2.6, -TD / 2 - .12)], false, 'catmullrom', .3);
+  const hose = new THREE.Mesh(new THREE.TubeGeometry(curve, 90, .022, 8), enhance(new THREE.MeshStandardMaterial({ color: 0x2b3336, roughness: .4 }), { key: 'hose', caustic: .4 }));
+  const nip = new THREE.Mesh(new THREE.CylinderGeometry(.03, .03, .08, 10), plastic); nip.rotation.z = Math.PI / 2; nip.position.set(FILTER.x + .09, by + 1.12, FILTER.z);
+  g.add(hose, nip);
+  addObst(FILTER.x, FILTER.z, .4, OUTLET.y + .25);
+  return shadowed(g);
+}
+scene.add(createFilter());
+
+const BUB_N = 170;
+const bub = { x: new Float32Array(BUB_N), y: new Float32Array(BUB_N), z: new Float32Array(BUB_N), r: new Float32Array(BUB_N), vy: new Float32Array(BUB_N),
+  dx: new Float32Array(BUB_N), dz: new Float32Array(BUB_N), ph: new Float32Array(BUB_N), alive: new Uint8Array(BUB_N), acc: 0, next: 0, mesh: null };
+function createBubbles(){
+  const mat = new THREE.ShaderMaterial({ transparent: true, depthWrite: false,
+    vertexShader: `varying vec3 vW;varying vec3 vN;void main(){vec4 w=modelMatrix*instanceMatrix*vec4(position,1.);vW=w.xyz;vN=normalize(mat3(instanceMatrix)*normal);gl_Position=projectionMatrix*viewMatrix*w;}`,
+    fragmentShader: `varying vec3 vW;varying vec3 vN;${GLSL_ENV}
+      void main(){vec3 V=normalize(vW-cameraPosition),N=normalize(vN);float c=max(dot(-V,N),0.);
+        float rim=pow(1.-c,2.2);                                                 // air/water boundary: bright total-reflection rim
+        vec3 R=reflect(V,N);
+        float hiTop=smoothstep(.55,.96,N.y)*smoothstep(.2,.8,c+.25);
+        float hiLow=(1.-smoothstep(-.95,-.5,N.y))*.35;
+        float spec=pow(max(dot(R,normalize(vec3(.1,1.,.25))),0.),60.);
+        vec3 col=vec3(.72,.93,1.)*(rim*.85+hiLow)+vec3(1.,.99,.95)*(hiTop*.9+spec*1.6)+envBase(R)*rim;
+        float a=clamp(rim*.8+hiTop*.75+hiLow*.6+spec+.05,0.,1.);
+        gl_FragColor=vec4(col,a);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }` });
+  const m = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 12, 9), mat, BUB_N);
+  m.name = 'Bubbles'; m.frustumCulled = false; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); m.renderOrder = 5;
+  _m1.makeScale(0, 0, 0); for (let i = 0; i < BUB_N; i++) m.setMatrixAt(i, _m1);
+  bub.mesh = m; return m;
+}
+function updateBubbles(t, dt){
+  // irregular release: rate breathes between ~8 and ~20 bubbles per second
+  bub.acc += dt * 14 * (.62 + .75 * vnoise(t * 1.7, 3.1) + (Math.sin(t * 9.1) > .93 ? .8 : 0));
+  while (bub.acc >= 1){
+    bub.acc -= 1;
+    for (let k = 0; k < BUB_N; k++){ const i = (bub.next + k) % BUB_N; if (!bub.alive[i]){
+      const a = rand() * TAU, d = Math.sqrt(rand()) * .055, big = rand() < .1;
+      bub.x[i] = OUTLET.x + Math.cos(a) * d; bub.z[i] = OUTLET.z + Math.sin(a) * d; bub.y[i] = OUTLET.y - .03 + rand() * .03;
+      bub.r[i] = big ? rr(.034, .05) : rr(.013, .027); bub.vy[i] = (.75 + 11 * bub.r[i]) * rr(.88, 1.14);
+      bub.dx[i] = rr(-.07, .07); bub.dz[i] = rr(-.07, .07); bub.ph[i] = rand() * TAU; bub.alive[i] = 1; bub.next = i + 1; break; } }
+  }
+  const arr = bub.mesh.instanceMatrix.array;
+  for (let i = 0; i < BUB_N; i++){
+    const o = i * 16;
+    if (!bub.alive[i]){ arr[o] = arr[o + 5] = arr[o + 10] = 0; continue; }
+    const hf = clamp((bub.y[i] - OUTLET.y) / (WL - OUTLET.y), 0, 1), c = currentAt(bub.x[i], bub.y[i], bub.z[i], t, _v1);
+    const wob = .09 * (.3 + hf);
+    bub.x[i] = clamp(bub.x[i] + (c.x * .1 + bub.dx[i] * (.4 + hf) + Math.sin(t * 6.3 + bub.ph[i]) * wob) * dt, -IX + .06, IX - .06);
+    bub.z[i] = clamp(bub.z[i] + (c.z * .1 + bub.dz[i] * (.4 + hf) + Math.cos(t * 5.1 + bub.ph[i] * 1.7) * wob) * dt, -IZ + .06, IZ - .06);
+    bub.y[i] += (bub.vy[i] + c.y * .12) * dt;
+    const r = bub.r[i] * (1 + .1 * hf);
+    if (bub.y[i] + r * .6 >= WL + waveH(bub.x[i], bub.z[i], t)){ bub.alive[i] = 0; addRipple(bub.x[i], bub.z[i], t, .45 + bub.r[i] * 22); arr[o] = arr[o + 5] = arr[o + 10] = 0; continue; }
+    const sq = 1 - .12 * Math.sin(t * 11 + bub.ph[i]) * Math.min(1, r * 25);           // slight oblate wobble
+    arr[o] = r / Math.sqrt(sq); arr[o + 5] = r * sq; arr[o + 10] = r / Math.sqrt(sq); arr[o + 15] = 1;
+    arr[o + 12] = bub.x[i]; arr[o + 13] = bub.y[i]; arr[o + 14] = bub.z[i];
+  }
+  bub.mesh.instanceMatrix.needsUpdate = true;
+}
+scene.add(createBubbles());
+/** simulation systems: each entry is (t, dt) in seconds */
+const updaters = [updateBubbles];
+
+/* ============================================================
+   6. STAGE 5 — MINIATURE CASTLE
+   ============================================================ */
+const CASTLE = { x: -0.4, z: -0.78, ry: 0.13 };
+function planarUV(geo, su = .96, sv = .88){           // box-projected UVs so stone courses stay level on every part
+  const p = geo.attributes.position, n = geo.attributes.normal, uv = new Float32Array(p.count * 2);
+  for (let i = 0; i < p.count; i++){
+    const ax = Math.abs(n.getX(i)), ay = Math.abs(n.getY(i)), az = Math.abs(n.getZ(i));
+    let u, v; if (ay > ax && ay > az){ u = p.getX(i); v = p.getZ(i); } else if (ax > az){ u = p.getZ(i); v = p.getY(i); } else { u = p.getX(i); v = p.getY(i); }
+    uv[i * 2] = u / su; uv[i * 2 + 1] = v / sv;
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2)); return geo;
+}
+function castleTexture(bump){
+  return makeCanvasTex(512, 512, (c, w, h) => {
+    const R = mulberry32(77), rows = 8, cols = 4, rh = h / rows, bw = w / cols;
+    c.fillStyle = bump ? '#3a3a3a' : '#615c53'; c.fillRect(0, 0, w, h);
+    for (let r = 0; r < rows; r++) for (let k = -1; k < cols; k++){
+      const s = hash2(r * 3.7, ((k + cols) % cols) * 9.1), x = (k + (r % 2) * .5) * bw + 2.5, y = r * rh + 2.5, v = 150 + s * 80;
+      c.fillStyle = bump ? `rgb(${v | 0},${v | 0},${v | 0})` : `rgb(${158 + s * 44 | 0},${154 + s * 42 | 0},${144 + s * 38 | 0})`;
+      c.fillRect(x, y, bw - 5, rh - 5);
+      c.fillStyle = bump ? 'rgba(0,0,0,.25)' : 'rgba(40,34,26,.22)'; c.fillRect(x, y + rh - 11, bw - 5, 6); c.fillRect(x + bw - 11, y, 6, rh - 5);   // worn lower/right edges
+    }
+    for (let i = 0; i < 3800; i++){ const d = R() < .5; c.fillStyle = d ? `rgba(20,18,14,${.05 + R() * .16})` : `rgba(235,225,205,${.04 + R() * .12})`; c.fillRect(R() * w, R() * h, 1 + R() * 3, 1 + R() * 3); }
+    c.strokeStyle = bump ? 'rgba(0,0,0,.9)' : 'rgba(38,32,26,.85)'; c.lineCap = 'round';
+    for (let i = 0; i < 7; i++){ let x = R() * w, y = R() * h; c.lineWidth = 1 + R() * 1.6; c.beginPath(); c.moveTo(x, y);
+      for (let k = 0; k < 7; k++){ x += (R() - .5) * 26; y += 8 + R() * 16; c.lineTo(x, y); } c.stroke(); }
+    for (let i = 0; i < 16; i++){ const x = Math.round(R() * cols * 2) * bw / 2, y = Math.round(R() * rows) * rh; c.fillStyle = bump ? 'rgba(0,0,0,.8)' : 'rgba(52,45,36,.8)';
+      c.beginPath(); c.ellipse(x + (R() - .5) * 8, y + (R() - .5) * 6, 5 + R() * 9, 3 + R() * 6, R() * 3, 0, TAU); c.fill(); }
+  }, !bump);
+}
+function createCastle(){
+  const g = new THREE.Group(); g.name = 'Castle';
+  const baseY = bedH(CASTLE.x, CASTLE.z) - .05;
+  g.position.set(CASTLE.x, baseY, CASTLE.z); g.rotation.y = CASTLE.ry;
+  const stone = [], dark = [], roof = [];
+  const put = (list, geo, x = 0, y = 0, z = 0, ry = 0, uvFix = true) => { if (ry) geo.rotateY(ry); geo.translate(x, y, z); let q = geo.index ? geo.toNonIndexed() : geo;
+    if (uvFix) planarUV(q); list.push(q); return q; };
+  const collide = (x, z, r, top) => { _v1.set(x, 0, z).applyAxisAngle(V3(0, 1, 0), CASTLE.ry); addObst(CASTLE.x + _v1.x, CASTLE.z + _v1.z, r, baseY + top); };
+  // --- gatehouse with a real arched passage (extruded wall with an arch-shaped hole) ---
+  const GH = 1.02, gate = new THREE.Shape();
+  gate.moveTo(-.78, -.2); gate.lineTo(.78, -.2); gate.lineTo(.78, GH); gate.lineTo(-.78, GH); gate.closePath();
+  const hole = new THREE.Path(); hole.moveTo(-.25, -.12); hole.lineTo(-.25, .4); hole.absarc(0, .4, .25, Math.PI, 0, true); hole.lineTo(.25, -.12); hole.closePath();
+  gate.holes.push(hole);
+  put(stone, new THREE.ExtrudeGeometry(gate, { depth: .92, bevelEnabled: false, curveSegments: 20 }), 0, 0, -.46);
+  // arch surround (voussoir band) + keystone, step, string course, parapet
+  const ring = new THREE.Shape(); ring.moveTo(-.33, 0); ring.lineTo(-.33, .4); ring.absarc(0, .4, .33, Math.PI, 0, true); ring.lineTo(.33, 0); ring.lineTo(.25, 0); ring.lineTo(.25, .4);
+  ring.absarc(0, .4, .25, 0, Math.PI, false); ring.lineTo(-.25, 0); ring.closePath();
+  put(stone, new THREE.ExtrudeGeometry(ring, { depth: .05, bevelEnabled: false, curveSegments: 20 }), 0, 0, .46);
+  put(stone, new THREE.BoxGeometry(.11, .15, .09), 0, .74, .49);
+  put(stone, new THREE.BoxGeometry(.8, .07, .2), 0, .0, .56);
+  put(stone, new THREE.BoxGeometry(1.62, .055, 1.0), 0, GH - .14, 0);
+  for (const sz of [-1, 1]){
+    put(stone, new THREE.BoxGeometry(1.56, .1, .1), 0, GH + .05, sz * .41);
+    for (let i = 0; i < 5; i++){ if (sz > 0 && i === 3) continue;                           // one merlon lost to time
+      put(stone, new THREE.BoxGeometry(.15 * rr(.9, 1.05), .13 * rr(.8, 1.1), .1), -.5 + i * .25, GH + .16, sz * .41, rr(-.05, .05)); }
+  }
+  put(stone, new THREE.BoxGeometry(2.75, .22, 1.75), .02, -.12, -.22);                       // foundation slab, mostly buried
+  collide(-.5, 0, .5, GH + .3); collide(.5, 0, .5, GH + .3); collide(0, 0, .5, GH + .3);
+  // --- towers ---
+  const tower = (x, z, r, h, opts = {}) => {
+    const pr = [[r + .07, -.2], [r + .07, .02], [r + .02, .1], [r, .18], [r, h - .26], [r + .03, h - .22], [r + .075, h - .13], [r + .075, h], [r - .01, h], [r - .01, h - .09], [0, h - .09]]
+      .map(p => new THREE.Vector2(p[0], p[1]));
+    const lg = new THREE.LatheGeometry(pr, 28), uv = lg.attributes.uv, p = lg.attributes.position, nU = Math.round(TAU * r / .96 * 2) / 2 || 1;
+    for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * Math.max(1, Math.round(nU)) + x, p.getY(i) / .88);
+    lg.computeVertexNormals(); put(stone, lg, x, 0, z, 0, false);
+    if (opts.roof){
+      const cone = new THREE.ConeGeometry(r + .13, opts.roof, 24, 4); put(roof, cone, x, h + opts.roof / 2 - .02, z, 0, false);
+      put(stone, new THREE.CylinderGeometry(r + .04, r + .075, .06, 24), x, h + .01, z);
+    } else {
+      const n = opts.merlons || 8;
+      for (let i = 0; i < n; i++){ if (i === opts.missing) continue; const a = i / n * TAU + .2;
+        put(stone, new THREE.BoxGeometry(.15, .14 * rr(.8, 1.1), .085), x + Math.sin(a) * (r + .03), h + .06, z + Math.cos(a) * (r + .03), a + rr(-.04, .04)); }
+    }
+    for (const [a, wy] of opts.windows || []){                                               // recessed arched windows: stone frame + dark reveal
+      const fr = new THREE.Shape(); fr.moveTo(-.075, 0); fr.lineTo(-.075, .13); fr.absarc(0, .13, .075, Math.PI, 0, true); fr.lineTo(.075, 0); fr.closePath();
+      const hl = new THREE.Path(); hl.moveTo(-.045, .025); hl.lineTo(-.045, .13); hl.absarc(0, .13, .045, Math.PI, 0, true); hl.lineTo(.045, .025); hl.closePath(); fr.holes.push(hl);
+      const fg = new THREE.ExtrudeGeometry(fr, { depth: .07, bevelEnabled: false, curveSegments: 10 }); fg.translate(0, 0, r - .025);
+      put(stone, fg, x, wy, z, a);
+      const dk = new THREE.BoxGeometry(.1, .17, .02); dk.translate(0, .095, r + .0); put(dark, dk, x, wy, z, a, false);
+      const sill = new THREE.BoxGeometry(.19, .03, .06); sill.translate(0, -.012, r + .03); put(stone, sill, x, wy, z, a);
+    }
+    collide(x, z, r + .1, h + (opts.roof || .2) + .1);
+  };
+  tower(-.98, .16, .36, 1.62, { merlons: 9, windows: [[.25, 1.05], [-.5, .55], [2.6, .9], [-2.2, 1.15]] });
+  tower(.98, .2, .32, 1.26, { merlons: 8, missing: 2, windows: [[-.2, .78], [.9, .5], [3.3, .7]] });
+  tower(.78, -.78, .29, 1.5, { roof: .5, windows: [[.5, 1.05], [2.2, .7], [-1.6, 1.1], [3.6, 1.0]] });
+  // --- curtain walls: right side joins the two right towers, left side is a lower weathered stub ---
+  const wall = (x, z, len, h, ry) => { const b = new THREE.BoxGeometry(.2, h + .2, len); b.translate(0, h / 2 - .1, 0); put(stone, b, x, 0, z, ry);
+    const n = Math.floor(len / .26); for (let i = 0; i < n; i++){ const m = new THREE.BoxGeometry(.2, .12, .13); m.translate(0, h + .06, (i - (n - 1) / 2) * .26); put(stone, m, x, 0, z, ry); } };
+  wall(.9, -.3, .62, .82, .2); collide(.9, -.3, .28, 1.2);
+  wall(-1.0, -.52, .7, .5, -.06); collide(-1.0, -.5, .3, .9);
+  put(stone, new THREE.BoxGeometry(.22, .3, .25), -.98, .1, -.95, .3);                       // fallen block
+  const tex = castleTexture(false), btex = castleTexture(true);
+  const sm = enhance(new THREE.MeshStandardMaterial({ map: tex, bumpMap: btex, bumpScale: 3.2, roughness: .9, color: 0xd6d0c4 }), { key: 'castle', fragHead: GLSL_NOISE,
+    fragColor: `{float al=(1.-smoothstep(${f(baseY + .05)},${f(baseY + .8)},vWPos.y))*(.2+.8*n3(vWPos*3.3))+.12*smoothstep(.68,.86,n3(vWPos*1.9+4.));
+      diffuseColor.rgb*=.8+.34*n3(vWPos*vec3(7.,1.5,7.));                                    // rain-like weathering streaks
+      diffuseColor.rgb=mix(diffuseColor.rgb,diffuseColor.rgb*vec3(.46,.62,.34)+vec3(.0,.012,.0),clamp(al,0.,1.)*.6);}` });   // algae near the base
+  const stoneMesh = new THREE.Mesh(mergeGeometries(stone), sm); stoneMesh.name = 'CastleStone';
+  const darkMesh = new THREE.Mesh(mergeGeometries(dark), new THREE.MeshStandardMaterial({ color: 0x07090a, roughness: .9 })); darkMesh.name = 'CastleWindowReveals';
+  const roofG = mergeGeometries(roof);
+  const roofMesh = new THREE.Mesh(roofG, enhance(new THREE.MeshStandardMaterial({ color: 0x55616b, roughness: .8, flatShading: false }), { key: 'roof', fragHead: GLSL_NOISE,
+    fragColor: `diffuseColor.rgb*=(.75+.4*n3(vWPos*9.))*(.85+.15*step(.5,fract(vWPos.y*11.)));` })); roofMesh.name = 'CastleRoof';
+  g.add(stoneMesh, darkMesh, roofMesh);
+  return shadowed(g);
+}
+scene.add(createCastle());
+
+/* ============================================================
+   7. STAGE 6 — FOUR AQUATIC PLANTS (shared leaf utilities, separate builders)
+   ============================================================ */
+const newAcc = () => ({ pos: [], col: [], uv: [], flex: [], idx: [] });
+/** ribbon leaf: path(t)->V3, side(t)->unit V3, width(t), color(t,u)->[r,g,b], flex(t)->world amplitude */
+function addRibbon(A, o){
+  const segs = o.segs || 16, ac = o.across || 2, base = A.pos.length / 3, T = V3(), N = V3(), c = V3(), s = V3();
+  for (let j = 0; j <= segs; j++){
+    const t = j / segs; c.copy(o.path(t)); T.copy(o.path(Math.min(1, t + .02))).sub(o.path(Math.max(0, t - .02))).normalize();
+    s.copy(o.side(t)); s.addScaledVector(T, -s.dot(T)).normalize(); N.crossVectors(s, T).normalize();
+    const w = o.width(t);
+    for (let i = 0; i <= ac; i++){
+      const u = i / ac, a = (u - .5) * 2;
+      const lift = (o.crease || 0) * w * Math.abs(a) + (o.curl || 0) * w * a * a + (o.wrinkle || 0) * Math.sin(t * (o.wf || 40) + a * 2.3 + (o.phase || 0) * 3);
+      A.pos.push(c.x + s.x * a * w * .5 + N.x * lift, c.y + s.y * a * w * .5 + N.y * lift, c.z + s.z * a * w * .5 + N.z * lift);
+      const k = o.color(t, u); A.col.push(k[0], k[1], k[2]); A.uv.push(u, t);
+      A.flex.push(o.flex(t), o.phase || 0, t * (o.delay || 0));
+    }
+  }
+  for (let j = 0; j < segs; j++) for (let i = 0; i < ac; i++){ const a = base + j * (ac + 1) + i, b = a + 1, d = a + ac + 1, e = d + 1; A.idx.push(a, b, d, b, e, d); }
+}
+function addTube(A, o){
+  const segs = o.segs || 10, rad = o.radial || 5, base = A.pos.length / 3, T = V3(), N = V3(), B = V3(), c = V3();
+  for (let j = 0; j <= segs; j++){
+    const t = j / segs; c.copy(o.path(t)); T.copy(o.path(Math.min(1, t + .02))).sub(o.path(Math.max(0, t - .02))).normalize();
+    N.set(1, 0, 0); if (Math.abs(T.x) > .9) N.set(0, 0, 1); N.addScaledVector(T, -N.dot(T)).normalize(); B.crossVectors(T, N);
+    const r = o.radius(t), k = o.color(t);
+    for (let i = 0; i < rad; i++){ const a = i / rad * TAU, cx = Math.cos(a) * r, sx = Math.sin(a) * r;
+      A.pos.push(c.x + N.x * cx + B.x * sx, c.y + N.y * cx + B.y * sx, c.z + N.z * cx + B.z * sx); A.col.push(k[0], k[1], k[2]); A.uv.push(.25, t);
+      A.flex.push(o.flex(t), o.phase || 0, t * (o.delay || 0)); }
+  }
+  for (let j = 0; j < segs; j++) for (let i = 0; i < rad; i++){ const a = base + j * rad + i, b = base + j * rad + (i + 1) % rad, d = a + rad, e = b + rad; A.idx.push(a, d, b, b, d, e); }
+}
+function accMesh(A, mat){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(A.pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(A.col, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(A.uv, 2)); g.setAttribute('aFlex', new THREE.Float32BufferAttribute(A.flex, 3));
+  g.setIndex(A.idx); g.computeVertexNormals();
+  const m = new THREE.Mesh(g, mat); m.castShadow = m.receiveShadow = true; m.frustumCulled = false; return m;
+}
+/** vein = [side-vein count, slant, midrib strength, side-vein strength]; flutter = extra fine motion */
+function leafMaterial(vein, flutter, rough = .5, glow = .16){
+  return enhance(new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: rough, metalness: 0 }), {
+    key: 'leaf', caustic: .8, uniforms: { uVein: { value: new THREE.Vector4(...vein) }, uFlutter: { value: flutter }, uGlow: { value: glow } },
+    vertHead: `attribute vec3 aFlex;uniform float uFlutter;${GLSL_CURRENT}`,
+    vertBody: `{vec3 cur=currentAt(position*vec3(.8,.5,.8)+vec3(aFlex.y,0.,aFlex.y*.7),uTime-aFlex.z);
+      float fl=sin(uTime*1.9+aFlex.y*5.+position.y*4.-aFlex.z*2.)*uFlutter;
+      transformed+=vec3(cur.x+fl,cur.y*.2,cur.z+fl*.6)*aFlex.x;}`,                         // roots have aFlex.x = 0 and stay fixed
+    fragHead: `uniform vec4 uVein;uniform float uGlow;`,
+    fragColor: `{float u=vUvC.x,v=vUvC.y;float mid=1.-smoothstep(0.,.075,abs(u-.5));
+      float sv=smoothstep(.8,1.,sin((v*uVein.x-abs(u-.5)*uVein.y)*6.2832));
+      diffuseColor.rgb*=1.-mid*uVein.z-sv*uVein.w*(1.-mid);}`,
+    fragLight: `reflectedLight.indirectDiffuse+=diffuseColor.rgb*uGlow;`                    // light passing through thin tissue
+  });
+}
+const mixc = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+
+function createVallisneria(){
+  const g = new THREE.Group(); g.name = 'Plant_Vallisneria';
+  const bx = -3.2, bz = -1.35, A = newAcc(), n = 11;
+  for (let i = 0; i < n; i++){
+    const a = i / n * TAU + rr(-.2, .2), r0 = rr(.02, .09), L = lerp(3.3, 4.85, Math.pow(rand(), .7)), k = rr(.55, 1.2), tw = rr(-1.6, 1.6), w0 = rr(.09, .13), sh = rand();
+    const lean = V3(Math.cos(a) * .6 + .72, 0, Math.sin(a) * .6 + .58).normalize(), s0 = V3(-lean.z, 0, lean.x);
+    const b = V3(bx + Math.cos(a) * r0, bedH(bx, bz) - .04, bz + Math.sin(a) * r0);
+    addRibbon(A, { segs: 30, across: 2, crease: .16, phase: i * .83, delay: 1.7,
+      path: t => _v3.copy(b).addScaledVector(lean, L * (.05 * t + .25 * t * t * t) * k).setY(b.y + L * (t - .21 * Math.pow(t, 3.5))),
+      side: t => _v2.copy(s0).multiplyScalar(Math.cos(tw * t)).addScaledVector(lean, Math.sin(tw * t)),
+      width: t => w0 * (.8 + .2 * Math.sin(Math.PI * t)) * (1 - .9 * smooth(.9, 1, t)) * smooth(-.05, .05, t),
+      color: (t, u) => mixc([.035, .2, .06], [.2 + .1 * sh, .58, .13], smooth(0, 1, t) * (.75 + .25 * sh) + .08 * Math.sin(t * 9 + i)),
+      flex: t => .4 * Math.pow(t, 1.7) * (.85 + .3 * sh) });
+  }
+  g.add(accMesh(A, leafMaterial([0, 0, .32, 0], .05, .42, .2)));
+  addObst(bx, bz, .16, 0, true, false); addObst(bx + .25, bz + .2, .55, WL, false, true);
+  return g;
+}
+function createAnubias(){
+  const g = new THREE.Group(); g.name = 'Plant_Anubias';
+  const bx = -2.35, bz = .85, by = bedH(bx, bz), A = newAcc(), R = newAcc(), n = 7;
+  const rdir = V3(.9, 0, .43).normalize(), r0 = V3(bx - .2, by + .035, bz - .1);
+  addTube(R, { segs: 10, radial: 8, path: t => _v3.copy(r0).addScaledVector(rdir, t * .46).setY(r0.y + .02 * Math.sin(t * 3.1)), radius: t => .042 * (.55 + .45 * Math.sin(Math.PI * Math.pow(t, .7))) + .008,
+    color: t => mixc([.16, .2, .08], [.22, .17, .09], hash2(t * 31, 2)), flex: () => 0 });
+  for (let i = 0; i < 9; i++){ const t0 = rr(.1, .9), a = rr(0, TAU), p0 = V3().copy(r0).addScaledVector(rdir, t0 * .46);          // anchoring roots
+    addTube(R, { segs: 5, radial: 4, path: t => _v3.set(p0.x + Math.cos(a) * .1 * t, p0.y - .09 * t, p0.z + Math.sin(a) * .1 * t), radius: t => .008 * (1 - .6 * t), color: () => [.3, .27, .17], flex: () => 0 }); }
+  for (let i = 0; i < n; i++){
+    const t0 = (i + .5) / n, a = (i % 2 ? 1 : -1) * rr(.7, 1.5) + Math.atan2(rdir.z, rdir.x) + (t0 - .5) * 1.4, pl = rr(.38, .6), bl = rr(.52, .72), bw = bl * rr(.56, .68), sh = rand();
+    const d = V3(Math.cos(a), 0, Math.sin(a)), s0 = V3(-d.z, 0, d.x), p0 = V3().copy(r0).addScaledVector(rdir, t0 * .46).setY(r0.y + .03);
+    const el = rr(.9, 1.25), pe = V3().copy(p0).addScaledVector(d, pl * Math.cos(el)).setY(p0.y + pl * Math.sin(el));
+    addTube(A, { segs: 6, radial: 5, phase: i, delay: .4, path: t => _v3.lerpVectors(p0, pe, t).addScaledVector(d, .04 * Math.sin(t * Math.PI)), radius: () => .011, color: () => [.07, .22, .07], flex: t => .02 * t });
+    const tilt = rr(.15, .5);
+    addRibbon(A, { segs: 12, across: 6, crease: .1, curl: -.09, wrinkle: .004, wf: 22, phase: i, delay: .6,
+      path: t => _v3.copy(pe).addScaledVector(d, bl * t * Math.cos(tilt * (1 - .9 * t))).setY(pe.y + bl * (Math.sin(tilt) * t - .32 * t * t)),
+      side: () => s0, width: t => bw * Math.pow(Math.sin(Math.PI * Math.pow(t * .96 + .02, .78)), .72),
+      color: (t, u) => mixc([.01, .075, .024], [.032, .16, .048], .35 + .4 * sh + .25 * Math.abs(u - .5)),
+      flex: t => .02 + .045 * t });
+  }
+  g.add(accMesh(R, leafMaterial([0, 0, 0, 0], 0, .8, .05)), accMesh(A, leafMaterial([9, 2.2, .3, .17], .02, .3, .1)));
+  addObst(bx, bz, .3, 0, true, false); addObst(bx, bz, .6, by + 1.0, false, true);
+  return g;
+}
+function createJavaFern(){
+  const g = new THREE.Group(); g.name = 'Plant_JavaFern';
+  const bx = 2.55, bz = .15, by = bedH(bx, bz), A = newAcc(), R = newAcc(), n = 9;
+  const knot = new THREE.Mesh(stoneGeometry(61, .3, 12, 8), stoneMaterial({ color: 0x2b2418 })); knot.scale.set(.15, .08, .12); knot.position.set(bx, by + .04, bz); knot.castShadow = true; g.add(knot);
+  for (let i = 0; i < 12; i++){ const a = rr(0, TAU);
+    addTube(R, { segs: 5, radial: 4, path: t => _v3.set(bx + Math.cos(a) * .2 * t, by + .07 - .09 * t * t, bz + Math.sin(a) * .2 * t), radius: t => .009 * (1 - .6 * t), color: () => [.14, .1, .06], flex: () => 0 }); }
+  for (let i = 0; i < n; i++){
+    const a = i / n * TAU + rr(-.3, .3), L = rr(1.25, 2.05), W = rr(.17, .24), spread = rr(.35, .95), sh = rand(), nz = rr(0, 50), bend = rr(-.25, .25);
+    const d = V3(Math.cos(a), 0, Math.sin(a)), s0 = V3(-d.z, 0, d.x), b = V3(bx + d.x * .04, by + .07, bz + d.z * .04);
+    addRibbon(A, { segs: 26, across: 4, crease: .13, wrinkle: .011, wf: 34, phase: i * 1.1, delay: 1.5,
+      path: t => _v3.copy(b).addScaledVector(d, L * (.22 * t + .42 * t * t) * spread).addScaledVector(s0, L * bend * t * t).setY(b.y + L * (t - .33 * t * t - .1 * spread * t * t)),
+      side: t => _v2.copy(s0).addScaledVector(d, .3 * Math.sin(t * 2 + i)),
+      width: t => W * (Math.pow(Math.sin(Math.PI * Math.pow(t, .62)), .85) * (1 - .55 * t) + .06 * (1 - t)) * (1 + .16 * (vnoise(t * 8 + nz, i) - .5) * 2),   // uneven lance outline
+      color: (t, u) => mixc(mixc([.17, .27, .05], [.04, .33, .13], sh), [.3, .45, .12], .35 * t * t + .1 * vnoise(t * 14 + nz, u * 3)),
+      flex: t => .19 * t * t * (.8 + .4 * sh) });
+  }
+  g.add(accMesh(R, leafMaterial([0, 0, 0, 0], 0, .8, .05)), accMesh(A, leafMaterial([16, 1.5, .42, .12], .03, .45, .15)));
+  addObst(bx, bz, .2, 0, true, false); addObst(bx, bz, .7, by + 1.45, false, true);
+  return g;
+}
+function createCabomba(){
+  const g = new THREE.Group(); g.name = 'Plant_Cabomba';
+  const bx = 1.75, bz = -1.2, by = bedH(bx, bz), A = newAcc(), n = 6;
+  for (let i = 0; i < n; i++){
+    const a = i / n * TAU + rr(-.4, .4), r0 = rr(.03, .13), H = rr(1.75, 2.6), sway = rr(.08, .22), ph = rr(0, TAU), ld = V3(Math.cos(a), 0, Math.sin(a));
+    const b = V3(bx + ld.x * r0, by - .03, bz + ld.z * r0);
+    const stem = (t, out) => out.copy(b).addScaledVector(ld, H * (.1 * t + .07 * t * t)).setY(b.y + H * t).add(_v1.set(Math.sin(t * 5 + ph) * sway * t * .4, 0, Math.cos(t * 4 + ph) * sway * t * .4));
+    const fx = t => .34 * Math.pow(t, 1.5) * (H / 2.6);
+    addTube(A, { segs: 26, radial: 5, phase: i * 1.37, delay: 1.1, path: t => stem(t, _v3), radius: t => .014 * (1 - .55 * t), color: t => mixc([.05, .18, .05], [.16, .4, .1], t), flex: fx });
+    const nodes = Math.floor(H / .105), c = V3(), tip = V3(), dir = V3(), sd = V3();
+    for (let k = 2; k < nodes; k++){
+      const t = k / nodes, size = (.17 - .07 * t) * rr(.85, 1.1) * smooth(0, .12, t), col = mixc([.16, .46, .12], [.5, .82, .3], Math.pow(t, 1.4));
+      stem(t, c);
+      for (let f = 0; f < 2; f++){                                                    // opposite pairs, rotated at every node
+        const fa = k * 2.4 + f * Math.PI + i, needles = 7;
+        for (let q = 0; q < needles; q++){                                            // fan of fine needle segments
+          const sp = (q / (needles - 1) - .5) * 1.5, na = fa + sp, up = .3 + .25 * Math.cos(sp * 2);
+          dir.set(Math.cos(na), up, Math.sin(na)).normalize(); sd.set(-dir.z, 0, dir.x).normalize();
+          const len = size * (1 - .25 * Math.abs(sp)), w = .009, base = A.pos.length / 3, fl = fx(t), phs = i * 1.37 + t * 2.2;
+          tip.copy(c).addScaledVector(dir, len);
+          A.pos.push(c.x - sd.x * w, c.y, c.z - sd.z * w, c.x + sd.x * w, c.y, c.z + sd.z * w, tip.x, tip.y, tip.z);
+          A.col.push(col[0] * .7, col[1] * .75, col[2] * .7, col[0] * .7, col[1] * .75, col[2] * .7, col[0] * 1.15, col[1] * 1.1, col[2] * 1.3);   // lighter, translucent-looking tips
+          A.uv.push(.2, 0, .3, 0, .25, 1);
+          A.flex.push(fl, phs, t * 1.1, fl, phs, t * 1.1, fl + .05, phs + q * .2, t * 1.1 + .25);
+          A.idx.push(base, base + 1, base + 2);
+        }
+      }
+    }
+  }
+  g.add(accMesh(A, leafMaterial([0, 0, 0, 0], .1, .6, .3)));
+  addObst(bx, bz, .16, 0, true, false); addObst(bx + .1, bz, .5, by + 2.7, false, true);
+  return g;
+}
+scene.add(createVallisneria(), createAnubias(), createJavaFern(), createCabomba());
+
+/* ============================================================
+   8. STAGES 7–10 — FOUR FISH (shared rig utilities, one builder per species)
+   Fish space: +X = head, +Y = up, Z = lateral. Swimming is a vertex-shader wave travelling head → tail.
+   aFlex = (flex weight, phase delay, group): 0 tail-coupled fins, 1 pectorals, 2 long trailing filaments, 3 spare
+   ============================================================ */
+const FISH_VERT_HEAD = `attribute vec3 aFlex;uniform vec4 uSwim;uniform vec4 uFinA;uniform vec4 uFinP;uniform vec2 uGeom;`;
+const FISH_VERT_BODY = `{float s=max((uGeom.x-position.x)/uGeom.y,0.);float w=s<1.?s*s:2.*s-1.;
+  float lat=uSwim.y*w*sin(uSwim.x-s*3.6)+uSwim.z*w;                         // undulation grows toward the tail, head stays steady
+  int gi=int(aFlex.z+.5);
+  float fa=gi==0?uFinA.x:gi==1?uFinA.y:gi==2?uFinA.z:uFinA.w;
+  float fp=gi==0?uFinP.x:gi==1?uFinP.y:gi==2?uFinP.z:uFinP.w;
+  float fl=aFlex.x*fa*sin(fp-aFlex.y);                                      // phase-delayed fin membranes
+  if(gi==1){transformed.x+=fl;transformed.y+=fl*.4;}else lat+=fl+uSwim.z*aFlex.x*1.2;
+  transformed.z+=lat;
+  transformed.z*=1.+uSwim.w*exp(-pow((s-.27)*12.,2.));}`;                   // gill breathing
+const GLSL_SCALES = `float scalePat(vec3 p,float k){vec2 q=p.xy*k;q.x+=.5*floor(q.y);vec2 c=fract(q)-.5;return smoothstep(.22,.5,length(c*vec2(1.,1.25)));}`;
+const fishUniforms = (headX, len) => ({ uSwim: { value: new THREE.Vector4() }, uFinA: { value: new THREE.Vector4() }, uFinP: { value: new THREE.Vector4() }, uGeom: { value: new THREE.Vector2(headX, len) } });
+function fishBodyGeometry(sp){
+  const NS = 48, NA = 22, pos = [], uv = [], idx = [];
+  for (let j = 0; j <= NS; j++){ const s = j / NS, x = sp.headX - s * sp.len, T = sp.top(s), B = sp.bot(s), W = sp.wid(s);
+    for (let i = 0; i < NA; i++){ const a = i / NA * TAU, c = Math.cos(a), sn = Math.sin(a); pos.push(x, (c >= 0 ? T : B) * c, W * Math.sign(sn) * Math.pow(Math.abs(sn), sp.flat || 1)); uv.push(s, i / NA); } }
+  for (let j = 0; j < NS; j++) for (let i = 0; i < NA; i++){ const a = j * NA + i, b = j * NA + (i + 1) % NA, c = a + NA, d = b + NA; idx.push(a, c, b, b, c, d); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals(); return g;
+}
+const newFinAcc = () => ({ pos: [], col: [], uv: [], flex: [], idx: [] });
+/** fin membrane: root(u)/tip(u) -> [x,y,z]; color(u,v)->[r,g,b,a]; flex(u,v); delay(u,v); ruffle = static waviness */
+function addFin(A, o){
+  const nu = o.nu || 12, nv = o.nv || 8, base = A.pos.length / 3;
+  for (let j = 0; j <= nv; j++) for (let i = 0; i <= nu; i++){
+    const u = i / nu, v = j / nv, r = o.root(u), t = o.tip(u), rz = (o.ruffle || 0) * v * Math.sin(u * (o.rf || 6) * Math.PI + v * 2.2);
+    A.pos.push(lerp(r[0], t[0], v), lerp(r[1], t[1], v), lerp(r[2] || 0, t[2] || 0, v) + rz);
+    const c = o.color(u, v); A.col.push(c[0], c[1], c[2], c[3] ?? 1); A.uv.push(u, v);
+    A.flex.push(o.flex(u, v), o.delay ? o.delay(u, v) : v * 1.6, o.group || 0);
+  }
+  for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++){ const a = base + j * (nu + 1) + i, b = a + 1, c = a + nu + 1, d = c + 1; A.idx.push(a, c, b, b, c, d); }
+}
+/** paired fin on both flanks: base [x,y,z], dir (unit, outward for +z side), axis = root line direction */
+function addPairedFin(A, o){
+  for (const sg of [1, -1]){
+    const b = [o.base[0], o.base[1], o.base[2] * sg], d = [o.dir[0], o.dir[1], o.dir[2] * sg], ax = o.axis;
+    addFin(A, { ...o, root: u => [b[0] + ax[0] * (u - .5) * o.rootW, b[1] + ax[1] * (u - .5) * o.rootW, b[2]],
+      tip: u => { const L = o.len * (o.shape ? o.shape(u) : 1); return [b[0] + d[0] * L + ax[0] * (u - .5) * o.tipW, b[1] + d[1] * L + ax[1] * (u - .5) * o.tipW, b[2] + d[2] * L]; } });
+  }
+}
+function finMesh(A, U, ray){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(A.pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(A.col, 4));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(A.uv, 2)); g.setAttribute('aFlex', new THREE.Float32BufferAttribute(A.flex, 3));
+  g.setIndex(A.idx); g.computeVertexNormals();
+  const mat = enhance(new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, side: THREE.DoubleSide, roughness: .42, depthWrite: true }), {   // fins write depth so the refraction march can resolve them
+    key: 'fin', caustic: .5, uniforms: { ...U, uRay: { value: new THREE.Vector4(...ray) } },
+    vertHead: FISH_VERT_HEAD, vertBody: FISH_VERT_BODY, fragHead: `uniform vec4 uRay;${GLSL_NOISE}`,
+    fragColor: `{float ry=smoothstep(.12,.5,abs(fract(vUvC.x*uRay.x)-.5));diffuseColor.rgb*=.74+.26*ry;                 // fin rays
+      float sp=smoothstep(uRay.y,uRay.y+.07,n3(vec3(vUvC*uRay.z,1.7)))*smoothstep(.08,.3,vUvC.y);diffuseColor.rgb*=1.-.85*sp;   // speckles
+      diffuseColor.a*=mix(1.,.55+.45*ry,uRay.w*vUvC.y);}`,                                                              // thin translucent membrane toward the edge
+    fragLight: `reflectedLight.indirectDiffuse+=diffuseColor.rgb*.22;` });
+  const m = new THREE.Mesh(g, mat); m.frustumCulled = false; m.name = 'Fins'; return m;
+}
+function eyeGeometry(r, iris, x, y, z){                 // glossy eye: pupil, coloured iris ring, pale sclera; pole faces outward (±Z)
+  const g = new THREE.SphereGeometry(r, 16, 12); g.rotateX(Math.PI / 2 * Math.sign(z)); g.scale(1, 1, .62);
+  const p = g.attributes.position, col = [];
+  for (let i = 0; i < p.count; i++){ const a = Math.acos(clamp(Math.abs(p.getZ(i)) / (r * .62), 0, 1)) * (p.getZ(i) * z > 0 ? 1 : 3);
+    const c = a < .62 ? [.01, .01, .012] : a < 1.02 ? iris : [.75, .76, .74]; col.push(c[0], c[1], c[2]); }
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); g.translate(x, y, z); return g;
+}
+/** assemble a fish: sp = {name,headX,len,top,bot,wid,pattern(GLSL),phys,fins(A),ray,eye:{s,h,r,iris},mouth} */
+function buildFish(sp){
+  const g = new THREE.Group(); g.name = sp.name;
+  const U = fishUniforms(sp.headX, sp.len);
+  const body = new THREE.Mesh(fishBodyGeometry(sp), enhance(new THREE.MeshPhysicalMaterial({ roughness: .36, metalness: 0, clearcoat: .55, clearcoatRoughness: .3, ...sp.phys }), {
+    key: sp.name, caustic: .55, uniforms: U, vertHead: FISH_VERT_HEAD, vertBody: FISH_VERT_BODY,
+    fragHead: `${GLSL_NOISE}${GLSL_SCALES}
+      const float HX=${f(sp.headX)};const float LEN=${f(sp.len)};
+      float gillLine(float s,float y,float s0,float k){return 1.-smoothstep(.0,.012,abs(s-s0+y*y*k));}
+      ${sp.pattern}`,
+    fragColor: `diffuseColor.rgb=fishColor(vOPos,(HX-vOPos.x)/LEN);` }));
+  body.name = 'Body'; body.castShadow = true; body.frustumCulled = false;
+  const A = newFinAcc(); sp.fins(A);
+  const e = sp.eye, ex = sp.headX - e.s * sp.len, ey = e.h, ez = sp.wid(e.s) * e.z;
+  const parts = [eyeGeometry(e.r, e.iris, ex, ey, ez), eyeGeometry(e.r, e.iris, ex, ey, -ez)];
+  const mo = new THREE.SphereGeometry(1, 10, 8); mo.scale(sp.mouth[2] * .6, sp.mouth[2] * .45, sp.mouth[2]); mo.translate(sp.headX - sp.mouth[0], sp.mouth[1], 0);
+  mo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(mo.attributes.position.count * 3).fill(.045), 3)); parts.push(mo);
+  const det = new THREE.Mesh(mergeGeometries(parts), new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: .06, clearcoat: 1, clearcoatRoughness: .04 })); det.name = 'EyesMouth';
+  g.add(body, finMesh(A, U, sp.ray), det);
+  g.userData = { U, sp };
+  return g;
+}
+const rgba = (c, a = 1) => [c[0], c[1], c[2], a];
+
+/* ---------- Fish 1: fancy guppy ---------- */
+function createGuppy(){
+  const sp = { name: 'Fish_Guppy', headX: .34, len: .5,
+    top: prof([[0, 0], [.03, .026], [.14, .052], [.36, .068], [.6, .054], [.84, .03], [1, .021]]),
+    bot: prof([[0, 0], [.03, .022], [.16, .055], [.4, .074], [.64, .05], [.84, .028], [1, .021]]),
+    wid: prof([[0, 0], [.04, .022], [.18, .04], [.4, .046], [.7, .028], [1, .008]]),
+    phys: { iridescence: 1, iridescenceIOR: 1.6, roughness: .3 }, ray: [20, .6, 16, .8],
+    eye: { s: .12, h: .014, r: .019, z: .82, iris: [.75, .78, .72] }, mouth: [.008, -.006, .012],
+    pattern: `vec3 fishColor(vec3 p,float s){
+      vec3 c=mix(vec3(.82,.87,.90),vec3(.42,.54,.64),smoothstep(-.03,.045,p.y));              // silver-blue flanks
+      c=mix(c,vec3(.27,.33,.30),smoothstep(.03,.066,p.y));                                    // olive back
+      float bl=n3(vec3(p.x*13.,p.y*17.,abs(p.z)*9.)+2.);
+      c=mix(c,mix(vec3(.04,.72,.80),vec3(.22,.86,.36),n3(p*21.)),smoothstep(.42,.6,bl)*smoothstep(.28,.5,s));   // iridescent turquoise/green patches
+      c=mix(c,vec3(1.,.42,.08),smoothstep(.6,.7,n3(p*16.+9.))*smoothstep(.55,.82,s)*.85);
+      c=mix(c,vec3(.03,.03,.05),1.-smoothstep(.014,.024,distance(vec2(s,p.y),vec2(.63,.012))));
+      c*=1.-.14*scalePat(p,95.);c*=1.-.45*gillLine(s,p.y,.235,9.)*step(abs(p.y),.05);
+      return c;}`,
+    fins: A => {
+      const tx = sp.headX - sp.len, X = s => sp.headX - s * sp.len;
+      // large triangular fan tail: orange-red, dark speckles, translucent rim
+      addFin(A, { nu: 20, nv: 14, ruffle: .012, rf: 5, root: u => [tx + .03, lerp(-.019, .019, u), 0],
+        tip: u => { const p = lerp(-.56, .56, u), R = Math.min(.3 / Math.cos(p), .345); return [tx - R * Math.cos(p), R * Math.sin(p), 0]; },
+        color: (u, v) => rgba(mixc(mixc([.95, .5, .12], [1, .22, .05], smooth(.05, .6, v)), [1, .75, .4], smooth(.86, 1, v)), lerp(.97, .5, smooth(.8, 1, v))),
+        flex: (u, v) => .1 * v * v + .02 * v, delay: (u, v) => v * 2.1 + Math.abs(u - .5) * .8 });
+      // dorsal
+      addFin(A, { nu: 8, nv: 6, root: u => [X(lerp(.44, .66, u)), sp.top(lerp(.44, .66, u)) * .85, 0], tip: u => [X(lerp(.5, .9, u)), .07 + .1 * Math.sin(u * 2.4 + .4), 0],
+        color: (u, v) => rgba(mixc([.9, .55, .2], [1, .3, .08], v), lerp(.95, .6, v)), flex: (u, v) => .03 * v, delay: (u, v) => v + u });
+      // anal fin
+      addFin(A, { nu: 5, nv: 4, root: u => [X(lerp(.52, .64, u)), -sp.bot(lerp(.52, .64, u)) * .85, 0], tip: u => [X(lerp(.58, .74, u)), -.075 - .035 * Math.sin(u * 3), 0],
+        color: (u, v) => rgba([.9, .6, .3], lerp(.9, .55, v)), flex: (u, v) => .02 * v });
+      // pectorals + pelvic ("underside") pair
+      addPairedFin(A, { nu: 5, nv: 5, group: 1, base: [X(.255), -.006, .038], dir: [-.72, -.3, .62], axis: [.1, 1, 0], rootW: .028, tipW: .06, len: .085, shape: u => .75 + .25 * Math.sin(u * Math.PI),
+        color: (u, v) => rgba([.8, .88, .9], lerp(.6, .3, v)), flex: (u, v) => .035 * v, delay: (u, v) => v * 1.2 });
+      addPairedFin(A, { nu: 4, nv: 4, group: 0, base: [X(.44), -.066, .014], dir: [-.6, -.78, .2], axis: [1, 0, 0], rootW: .03, tipW: .02, len: .055,
+        color: (u, v) => rgba([.9, .7, .5], lerp(.8, .4, v)), flex: (u, v) => .012 * v });
+    } };
+  const g = buildFish(sp);
+  g.userData.nav = { rad: .4, up: .16, down: .12, yMin: 2.3, yMax: 4.1, cruise: .42, burst: 1.0, turn: 2.6, accel: 1.6, hover: .3, hoverT: .6, tailF: 15, amp: .028, pec: 11, seed: 11, kind: 'guppy' };
+  return g;
+}
+
+/* ---------- Fish 2: clownfish ---------- */
+function createClownfish(){
+  const sp = { name: 'Fish_Clownfish', headX: .5, len: .78,
+    top: prof([[0, 0], [.025, .062], [.1, .128], [.28, .182], [.5, .19], [.72, .142], [.9, .074], [1, .056]]),
+    bot: prof([[0, 0], [.025, .055], [.1, .118], [.28, .172], [.5, .18], [.72, .132], [.9, .07], [1, .056]]),
+    wid: prof([[0, 0], [.03, .05], [.14, .088], [.35, .104], [.6, .088], [.85, .04], [1, .016]]),
+    phys: { roughness: .42, clearcoat: .4 }, ray: [26, 2, 1, .35],
+    eye: { s: .105, h: .04, r: .034, z: .86, iris: [.85, .45, .1] }, mouth: [.006, -.012, .022],
+    pattern: `vec3 fishColor(vec3 p,float s){
+      vec3 org=mix(vec3(1.,.36,.02),vec3(1.,.5,.07),smoothstep(-.02,.14,-p.y));
+      org*=1.-.22*smoothstep(.06,.18,p.y);
+      float wob=(n3(vec3(p.y*8.,p.z*8.,1.))-.5)*.06+.022*sin(p.y*15.+1.);
+      float d1=abs(s-.2-wob*.6+p.y*p.y*1.3)-.05;                                             // head band curves behind the eye
+      float d2=abs(s-.53-wob)-.062*(1.+.45*smoothstep(-.05,.17,p.y));                        // mid band bulges toward the back
+      float d3=abs(s-.935-wob*.4)-.034;
+      float m=min(min(d1,d2),d3);
+      vec3 c=mix(vec3(.025),org,smoothstep(.017,.024,m));                                    // narrow dark border
+      c=mix(vec3(.97,.97,.94),c,smoothstep(-.004,.004,m));                                   // white band, wrapped around the body
+      c*=1.-.07*scalePat(p,60.);c*=1.-.4*gillLine(s,p.y,.17,2.5)*step(abs(p.y),.11);
+      return c;}`,
+    fins: A => {
+      const tx = sp.headX - sp.len, X = s => sp.headX - s * sp.len, edge = (v, a = .82) => smooth(a, .97, v);
+      const oc = (u, v) => rgba(mixc([1, .42, .04], [.02, .02, .02], edge(v)), .97);
+      // rounded fan tail with dark edging
+      addFin(A, { nu: 16, nv: 10, ruffle: .008, rf: 4, root: u => [tx + .04, lerp(-.052, .052, u), 0],
+        tip: u => { const p = lerp(-1.05, 1.05, u), R = .25 * (.8 + .2 * Math.cos(p * 1.2)); return [tx - .02 - R * Math.cos(p), R * 1.05 * Math.sin(p), 0]; },
+        color: oc, flex: (u, v) => .06 * v * v + .012 * v, delay: (u, v) => v * 1.8 });
+      // dorsal: spiny front lobe + soft rear lobe
+      addFin(A, { nu: 20, nv: 6, root: u => [X(lerp(.24, .84, u)), sp.top(lerp(.24, .84, u)) * .9, 0],
+        tip: u => [X(lerp(.3, .93, u)), sp.top(lerp(.24, .84, u)) * .9 + .085 * Math.sin(Math.PI * Math.min(u / .55, 1)) * (u < .55 ? 1 : 0) + (u >= .5 ? .12 * Math.sin(Math.PI * (u - .5) / .5) : 0) + .012, 0],
+        color: oc, flex: (u, v) => .018 * v, delay: (u, v) => v + u * 2 });
+      // anal fin
+      addFin(A, { nu: 8, nv: 5, root: u => [X(lerp(.58, .84, u)), -sp.bot(lerp(.58, .84, u)) * .9, 0], tip: u => [X(lerp(.66, .94, u)), -sp.bot(lerp(.58, .84, u)) * .9 - .11 * Math.sin(Math.PI * Math.pow(u, .8)) - .01, 0],
+        color: oc, flex: (u, v) => .018 * v, delay: (u, v) => v + u });
+      // pectorals (rounded paddles) + pelvic pair
+      addPairedFin(A, { nu: 8, nv: 6, group: 1, base: [X(.3), -.05, .098], dir: [-.6, -.25, .76], axis: [.15, 1, 0], rootW: .07, tipW: .15, len: .16, shape: u => .7 + .3 * Math.sin(u * Math.PI),
+        color: (u, v) => rgba(mixc([1, .5, .08], [.03, .03, .03], edge(v, .86)), .9), flex: (u, v) => .06 * v, delay: (u, v) => v * 1.3 + u * .6 });
+      addPairedFin(A, { nu: 5, nv: 5, group: 0, base: [X(.36), -.165, .03], dir: [-.55, -.8, .25], axis: [1, 0, 0], rootW: .06, tipW: .05, len: .14, shape: u => 1 - .4 * u,
+        color: (u, v) => rgba(mixc([1, .42, .04], [.02, .02, .02], edge(v, .8)), .95), flex: (u, v) => .02 * v });
+    } };
+  const g = buildFish(sp);
+  g.userData.nav = { rad: .52, up: .32, down: .32, yMin: 1.5, yMax: 3.4, cruise: .36, burst: .6, turn: 1.7, accel: .8, hover: .15, tailF: 9, amp: .034, pec: 6.5, seed: 23, kind: 'clown' };
+  return g;
+}
+
+/* ---------- Fish 3: freshwater angelfish ---------- */
+function createAngelfish(){
+  const band = s => Math.max(1 - smooth(.03, .07, Math.abs(s - .36)), 1 - smooth(.035, .075, Math.abs(s - .63)), 1 - smooth(.02, .05, Math.abs(s - .95)));
+  const silver = [.84, .86, .82], dark = [.07, .07, .08];
+  const sp = { name: 'Fish_Angelfish', headX: .42, len: .62, flat: .85,
+    top: prof([[0, 0], [.025, .04], [.12, .15], [.3, .245], [.5, .268], [.7, .2], [.88, .07], [1, .044]]),
+    bot: prof([[0, 0], [.025, .04], [.12, .14], [.3, .245], [.5, .268], [.7, .2], [.88, .07], [1, .044]]),
+    wid: prof([[0, 0], [.04, .028], [.2, .05], [.45, .056], [.75, .034], [1, .011]]),
+    phys: { iridescence: .9, iridescenceIOR: 1.45, roughness: .26, clearcoat: .75 }, ray: [34, 2, 1, .9],
+    eye: { s: .125, h: .045, r: .03, z: .84, iris: [.85, .3, .08] }, mouth: [.004, -.02, .014],
+    pattern: `vec3 fishColor(vec3 p,float s){
+      vec3 c=mix(vec3(.87,.88,.84),vec3(.60,.65,.62),smoothstep(.0,.26,p.y));
+      c=mix(c,vec3(.95,.95,.91),smoothstep(.02,.22,-p.y));
+      c+=vec3(.05,.02,.07)*sin(p.y*40.+s*18.)*.35;                                           // faint pearlescent shift
+      float b=1.-smoothstep(.014,.032,abs(s-.115-p.y*.06));
+      b=max(b,1.-smoothstep(.028,.06,abs(s-.36+p.y*p.y*.25)));
+      b=max(b,1.-smoothstep(.034,.07,abs(s-.63)));
+      b=max(b,1.-smoothstep(.02,.045,abs(s-.95)));
+      c=mix(c,vec3(.06,.06,.07),b*.9);
+      c*=1.-.10*scalePat(p,50.);c*=1.-.35*gillLine(s,p.y,.2,1.2)*step(abs(p.y),.13);
+      return c;}`,
+    fins: A => {
+      const tx = sp.headX - sp.len, X = s => sp.headX - s * sp.len;
+      const tall = sign => {                                                                 // dorsal (+1) and anal (-1): swept rays form the high diamond silhouette
+        const s0 = sign > 0 ? .36 : .42, s1 = .86, edgeY = s => (sign > 0 ? sp.top(s) : sp.bot(s)) * .9 * sign;
+        addFin(A, { nu: 22, nv: 12, ruffle: .01, rf: 5, root: u => [X(lerp(s0, s1, u)), edgeY(lerp(s0, s1, u)), 0],
+          tip: u => { const L = .6 * Math.pow(1 - u, 1.35) + .075, sw = .78 - .25 * u, s = lerp(s0, s1, u); return [X(s) - L * Math.sin(sw), edgeY(s) + sign * L * Math.cos(sw), 0]; },
+          color: (u, v) => rgba(mixc(mixc(silver, [.95, .93, .8], v * .5), dark, band(lerp(s0, s1, u)) * (.85 - .25 * v)), lerp(.97, .5, smooth(.55, 1, v))),
+          flex: (u, v) => .085 * v * v * (1.2 - u), delay: (u, v) => v * 2.2 + u * .8 });
+      };
+      tall(1); tall(-1);
+      // modest tail with slightly extended outer rays
+      addFin(A, { nu: 14, nv: 9, ruffle: .006, rf: 4, root: u => [tx + .03, lerp(-.04, .04, u), 0],
+        tip: u => { const p = lerp(-.72, .72, u), R = .21 + .07 * Math.pow(Math.abs(p) / .72, 2.2); return [tx - R * Math.cos(p), R * Math.sin(p), 0]; },
+        color: (u, v) => rgba(mixc(silver, dark, (1 - smooth(.0, .22, v)) * .8 + .25 * (1 - smooth(.1, .25, Math.abs(v - .6)))), lerp(.95, .5, v)), flex: (u, v) => .06 * v * v + .01 * v, delay: (u, v) => v * 1.9 });
+      // two long pelvic filaments (group 2: flowing, strongly delayed) with fixed attachment
+      addPairedFin(A, { nu: 2, nv: 16, group: 2, base: [X(.31), -sp.bot(.31) * .93, .022], dir: [-.4, -.91, .1], axis: [1, 0, 0], rootW: .034, tipW: .004, len: .78,
+        color: (u, v) => rgba(mixc([.9, .9, .85], [.75, .78, .8], v), lerp(.98, .8, v)), flex: (u, v) => .2 * Math.pow(v, 1.8), delay: (u, v) => v * 3.4 });
+      addPairedFin(A, { nu: 6, nv: 5, group: 1, base: [X(.27), -.05, .053], dir: [-.72, -.2, .66], axis: [.2, 1, 0], rootW: .04, tipW: .09, len: .17, shape: u => .7 + .3 * Math.sin(u * Math.PI),
+        color: (u, v) => rgba([.85, .88, .86], lerp(.5, .22, v)), flex: (u, v) => .05 * v, delay: (u, v) => v * 1.3 });
+    } };
+  const g = buildFish(sp);
+  g.userData.nav = { rad: .5, up: .74, down: .92, yMin: 1.75, yMax: 3.45, cruise: .24, burst: .3, turn: .95, accel: .35, hover: .3, tailF: 6, amp: .024, pec: 5, seed: 37, kind: 'angel', pitchMax: .22 };
+  return g;
+}
+
+/* ---------- Fish 4: betta ---------- */
+function createBetta(){
+  const grad = v => mixc(mixc([.04, .1, .6], [.66, .07, .5], smooth(.1, .6, v)), [.5, .03, .14], smooth(.62, 1, v));
+  const scallop = (u, n) => 1 - .1 * Math.pow(Math.abs(Math.sin(u * Math.PI * n)), .6);
+  const sp = { name: 'Fish_Betta', headX: .44, len: .58,
+    top: prof([[0, 0], [.03, .032], [.14, .064], [.35, .08], [.6, .07], [.85, .05], [1, .042]]),
+    bot: prof([[0, 0], [.03, .03], [.14, .07], [.35, .088], [.6, .072], [.85, .05], [1, .042]]),
+    wid: prof([[0, 0], [.04, .03], [.18, .052], [.4, .058], [.7, .04], [1, .014]]),
+    phys: { iridescence: 1, iridescenceIOR: 1.7, roughness: .3, clearcoat: .8 }, ray: [30, 2, 1, .95],
+    eye: { s: .11, h: .02, r: .023, z: .84, iris: [.2, .6, .7] }, mouth: [.006, .004, .016],
+    pattern: `vec3 fishColor(vec3 p,float s){
+      vec3 c=mix(vec3(.04,.58,.66),vec3(.06,.09,.46),smoothstep(.12,.42,s));                 // turquoise head → deep blue body
+      c=mix(c,vec3(.28,.07,.44),smoothstep(.55,1.,s)*.8);                                    // violet toward the tail base
+      float sc=scalePat(p,64.);c=mix(c*1.3+vec3(0.,.07,.09),c*.55,sc);                       // scale rims
+      c*=1.-.25*smoothstep(.03,.075,p.y);c*=1.-.4*gillLine(s,p.y,.225,7.)*step(abs(p.y),.06);
+      return c;}`,
+    fins: A => {
+      const tx = sp.headX - sp.len, X = s => sp.headX - s * sp.len;
+      const fc = (u, v) => rgba(grad(v), lerp(.96, .5, smooth(.6, 1, v)));
+      // big veil caudal fin wrapping the tail base, scalloped edge
+      addFin(A, { nu: 30, nv: 16, ruffle: .04, rf: 7, root: u => [tx + .06, lerp(-.045, .045, u), 0],
+        tip: u => { const p = lerp(-1.3, 1.3, u), R = .5 * scallop(u, 8) * (.86 + .14 * Math.cos(p)); return [tx + .02 - R * Math.cos(p), R * Math.sin(p) - .03, 0]; },
+        color: fc, flex: (u, v) => .17 * v * v + .03 * v, delay: (u, v) => v * 2.8 + Math.abs(u - .5) * 1.4 });
+      // tall flowing dorsal
+      addFin(A, { nu: 20, nv: 11, ruffle: .03, rf: 6, root: u => [X(lerp(.5, .97, u)), sp.top(lerp(.5, .97, u)) * .9, 0],
+        tip: u => { const L = (.13 + .24 * Math.sin(Math.PI * Math.pow(u, .75))) * scallop(u, 6), s = lerp(.5, .97, u); return [X(s) - L * Math.sin(.95), sp.top(s) * .9 + L * Math.cos(.95), 0]; },
+        color: fc, flex: (u, v) => .11 * v * v, delay: (u, v) => v * 2.4 + u * 1.2 });
+      // long anal fin that deepens toward the tail
+      addFin(A, { nu: 24, nv: 11, ruffle: .03, rf: 8, root: u => [X(lerp(.36, .98, u)), -sp.bot(lerp(.36, .98, u)) * .9, 0],
+        tip: u => { const L = (.15 + .22 * Math.pow(u, .9)) * scallop(u, 8), s = lerp(.36, .98, u); return [X(s) - L * Math.sin(.62), -sp.bot(s) * .9 - L * Math.cos(.62), 0]; },
+        color: fc, flex: (u, v) => .11 * v * v, delay: (u, v) => v * 2.4 + u * 1.5 });
+      // long pointed ventral fins + small pectorals
+      addPairedFin(A, { nu: 3, nv: 12, group: 2, base: [X(.3), -sp.bot(.3) * .9, .02], dir: [-.52, -.84, .14], axis: [1, 0, 0], rootW: .04, tipW: .004, len: .3,
+        color: (u, v) => rgba(mixc([.7, .08, .3], [.2, .2, .8], v), .95), flex: (u, v) => .09 * v * v, delay: (u, v) => v * 2.6 });
+      addPairedFin(A, { nu: 6, nv: 5, group: 1, base: [X(.27), -.012, .054], dir: [-.7, -.22, .68], axis: [.15, 1, 0], rootW: .03, tipW: .08, len: .1, shape: u => .7 + .3 * Math.sin(u * Math.PI),
+        color: (u, v) => rgba([.5, .75, .9], lerp(.55, .25, v)), flex: (u, v) => .04 * v, delay: (u, v) => v * 1.2 });
+    } };
+  const g = buildFish(sp);
+  g.userData.nav = { rad: .62, up: .36, down: .42, yMin: 2.5, yMax: 3.95, cruise: .2, burst: .3, turn: 1.1, accel: .4, hover: .4, tailF: 7, amp: .034, pec: 8, seed: 53, kind: 'betta' };
+  return g;
+}
+
+/* ============================================================
+   9. STAGE 11 — INDIVIDUAL SWIMMING BEHAVIOUR
+   ============================================================ */
+addObst(FILTER.x, FILTER.z, .36, WL, false, true);            // keep fish out of the bubble plume
+const fishes = [];
+function fishBlocked(n, x, y, z, slack, pad = 0){
+  for (const o of OBST) if (o.fish && y - n.down < o.top + .25 && Math.hypot(x - o.x, z - o.z) < o.r + n.rad * slack + pad) return true;
+  return false;
+}
+function fishYRange(n, x, z, out){ out[0] = Math.max(bedH(x, z) + n.down + .14, n.yMin); out[1] = Math.min(WL - .16 - n.up, n.yMax); return out; }
+const _yr = [0, 0];
+function pickFishTarget(F){
+  const n = F.n, mx = IX - n.rad - .12, mz = IZ - Math.min(n.rad, .45) - .16;
+  for (let a = 0; a < 14; a++){
+    let x = lerp(-mx, mx, F.R()), z = lerp(-mz, mz, F.R());
+    if (n.kind === 'clown' && F.R() < .35){ const c = F.R() < .5; x = c ? CASTLE.x + lerp(-1.2, 1.2, F.R()) : 2.4 + lerp(-.6, .6, F.R()); z = c ? .55 + F.R() * .6 : 1.0 + F.R() * .4; }   // curious visits
+    fishYRange(n, x, z, _yr); const y = lerp(_yr[0], _yr[1], F.R());
+    if (fishBlocked(n, x, y, z, .7, .5)) continue;                 // destination must lie outside every avoidance field
+    let clear = true;                                           // test the whole path, not just the destination
+    for (let k = 1; k < 10 && clear; k++){ const t = k / 10; if (fishBlocked(n, lerp(F.pos.x, x, t), lerp(F.pos.y, y, t), lerp(F.pos.z, z, t), .7, .05)) clear = false; }
+    if (!clear && a < 13) continue;
+    F.target.set(x, y, z); return;
+  }
+}
+function spawnFish(g, x, y, z, yaw){
+  const n = g.userData.nav;
+  const F = { g, U: g.userData.U, n, pos: V3(x, y, z), yaw, pitch: 0, roll: 0, speed: n.cruise * .7, yawRate: 0, target: V3(x, y, z), tT: 0, state: 'cruise', sT: 2,
+    phase: rand() * TAU, pecPh: rand() * TAU, filPh: rand() * TAU, amp: n.amp * .6, R: mulberry32(n.seed), des: V3() };
+  g.rotation.order = 'YZX'; fishes.push(F); scene.add(g); return F;
+}
+function updateFish(F, t, dt){
+  const n = F.n, p = F.pos;
+  F.tT -= dt; F.pT = (F.pT || 0) + dt;
+  if (F.pT > 3.5){ const d = p.distanceTo(F.target); if (F.state !== 'hover' && (F.pD || 99) - d < .12) F.tT = 0; F.pD = d; F.pT = 0; }   // no progress → choose another destination
+  if (F.tT <= 0 || p.distanceTo(F.target) < .4){ pickFishTarget(F); F.tT = 6 + F.R() * 7; F.pD = 99; F.pT = 0; }
+  F.sT -= dt;
+  if (F.sT <= 0){ const r = F.R();
+    if (r < n.hover && F.state !== 'hover'){ F.state = 'hover'; F.sT = (n.hoverT || 1.2) * (1 + F.R() * 1.8); } else if (r < n.hover + .22){ F.state = 'burst'; F.sT = .5 + F.R() * .7; } else { F.state = 'cruise'; F.sT = 2.5 + F.R() * 4; } }
+  let want = F.state === 'hover' ? .025 : F.state === 'burst' ? n.burst : n.cruise * (.78 + .22 * Math.sin(t * .37 + n.seed));
+  const fx = Math.cos(F.pitch) * Math.cos(F.yaw), fy = Math.sin(F.pitch), fz = -Math.cos(F.pitch) * Math.sin(F.yaw);
+  const des = F.des.copy(F.target).sub(p); const dist = des.length() || 1; des.multiplyScalar(1 / dist);
+  // predictive wall / surface / bed avoidance using the full animated envelope
+  const look = .5 + F.speed * 1.4, lx = p.x + fx * look, ly = p.y + fy * look, lz = p.z + fz * look;
+  const mx = IX - n.rad - .06, mz = IZ - Math.min(n.rad, .5) - .06; fishYRange(n, p.x, p.z, _yr);
+  const soft = (v, lim) => { const d = Math.abs(v) - (lim - .45); return d > 0 ? -Math.sign(v) * Math.min(d / .45, 1.6) * 2.2 : 0; };
+  des.x += soft(lx, mx); des.z += soft(lz, mz);
+  if (ly > _yr[1] - .25) des.y -= (ly - (_yr[1] - .25)) * 4; if (ly < _yr[0] + .25) des.y += (_yr[0] + .25 - ly) * 4;
+  // obstacles: push away + slide around; low obstacles may also be cleared from above
+  for (const o of OBST){ if (!o.fish || p.y - n.down > o.top + .25) continue;
+    const dx = lerp(p.x, lx, .6) - o.x, dz = lerp(p.z, lz, .6) - o.z, d = Math.hypot(dx, dz) || 1e-3, R = o.r + n.rad * .7, pen = (R + .45 - d) / .45;
+    if (pen > 0){ const k = Math.min(pen, 1.6) * 2.4, nx = dx / d, nz = dz / d, side = (fz * nx - fx * nz) > 0 ? 1 : -1;
+      des.x += nx * k - nz * side * k * .7; des.z += nz * k + nx * side * k * .7; if (o.top < n.yMax - .3) des.y += k * .35; } }
+  for (const G of fishes){ if (G === F) continue; const dx = p.x - G.pos.x, dy = p.y - G.pos.y, dz = p.z - G.pos.z, d = Math.hypot(dx, dy * 1.4, dz) || 1e-3, R = (n.rad + G.n.rad) * .95;
+    if (d < R){ const k = (1 - d / R) * 2.5; des.x += dx / d * k; des.y += dy / d * k; des.z += dz / d * k; } }
+  des.normalize();
+  // heading control with turn-rate and acceleration limits
+  let e = Math.atan2(-des.z, des.x) - F.yaw; e = Math.atan2(Math.sin(e), Math.cos(e));
+  const maxRate = n.turn * (.45 + .55 * Math.min(1, F.speed / n.cruise));
+  F.yawRate += (clamp(e * 2.2, -maxRate, maxRate) - F.yawRate) * Math.min(1, dt * 3.5);
+  F.yaw += F.yawRate * dt;
+  const pm = n.pitchMax || .38;
+  F.pitch += (clamp(Math.asin(clamp(des.y, -1, 1)) * .8, -pm, pm) - F.pitch) * Math.min(1, dt * 1.6);
+  if (Math.abs(e) > 1.3) want *= .45;
+  const dv = clamp(want - F.speed, -n.accel * dt * 1.4, n.accel * dt); F.speed += dv;
+  const c = currentAt(p.x, p.y, p.z, t, _v1);
+  p.x += (fx * F.speed + c.x * .012) * dt; p.y += (fy * F.speed + c.y * .012) * dt; p.z += (fz * F.speed + c.z * .012) * dt;
+  // final safeguards: bounds and solid colliders
+  p.x = clamp(p.x, -mx, mx); p.z = clamp(p.z, -mz, mz); fishYRange(n, p.x, p.z, _yr); p.y = clamp(p.y, _yr[0], _yr[1]);
+  for (const o of OBST){ if (!o.fish || p.y - n.down > o.top) continue; const dx = p.x - o.x, dz = p.z - o.z, d = Math.hypot(dx, dz) || 1e-3, R = o.r + n.rad * .4;
+    if (d < R){ p.x = o.x + dx / d * R; p.z = o.z + dz / d * R; } }
+  F.roll += (clamp(-F.yawRate * .16, -.28, .28) - F.roll) * Math.min(1, dt * 3);
+  F.g.position.copy(p); F.g.rotation.set(F.roll, F.yaw, F.pitch);
+  // swimming effort drives tail beat; hovering keeps only small fin work
+  const eff = clamp(F.speed / n.cruise, 0, 2.2) + Math.abs(F.yawRate) * .25 + Math.max(dv, 0) / Math.max(dt, 1e-4) / n.accel * .5;
+  F.phase += dt * n.tailF * (.3 + .55 * Math.min(eff, 2.2));
+  F.amp += (n.amp * (.22 + .6 * Math.min(eff, 2)) - F.amp) * Math.min(1, dt * 3);
+  F.pecPh += dt * n.pec * (F.state === 'hover' ? 1.25 : .8); F.filPh += dt * 2.1;
+  F.U.uSwim.value.set(F.phase, F.amp, clamp(-F.yawRate * .04, -.07, .07), .035 * Math.sin(t * 3.1 + n.seed));
+  F.U.uFinA.value.set(.45 + .5 * Math.min(eff, 2), F.state === 'hover' ? 1.2 : .8, .7 + .3 * Math.sin(t * .7 + n.seed), 0);
+  F.U.uFinP.value.set(F.phase, F.pecPh, F.filPh, 0);
+}
+spawnFish(createGuppy(), -1.6, 3.5, .7, .3);
+spawnFish(createClownfish(), .9, 2.4, .8, 2.8);
+spawnFish(createAngelfish(), -2.2, 2.6, -.2, 0);
+spawnFish(createBetta(), 1.6, 3.4, .1, 3.3);
+updaters.push((t, dt) => { for (const F of fishes) updateFish(F, t, dt); });
+
+/* ============================================================
+   10. STAGE 12 — BOTTOM-WALKING CRAB (IK legs, planted feet, sideways gait)
+   Crab space: +X = sideways travel axis, +Z = front (eyes and claws), +Y = up
+   ============================================================ */
+function paint(geo, c, c2){                     // uniform (or y-graded) vertex colour
+  const p = geo.attributes.position, col = new Float32Array(p.count * 3); geo.computeBoundingBox(); const b = geo.boundingBox;
+  for (let i = 0; i < p.count; i++){ const t = c2 ? (p.getY(i) - b.min.y) / (b.max.y - b.min.y || 1) : 0; col[i * 3] = c2 ? lerp(c[0], c2[0], t) : c[0]; col[i * 3 + 1] = c2 ? lerp(c[1], c2[1], t) : c[1]; col[i * 3 + 2] = c2 ? lerp(c[2], c2[2], t) : c[2]; }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3)); return geo;
+}
+const crab = { g: null, pos: V3(1.6, 0, 1.05), yaw: .3, yawRate: 0, speed: 0, move: 0, gait: 0, target: V3(1.6, 0, 1.05), state: 'pause', sT: 1.5, legs: [], claws: [], eyes: [], R: mulberry32(4242), dir: V3(1, 0, 0), gest: 0, gestClaw: 0 };
+const L1 = .15, L2 = .175, STRIDE = .15;
+function createCrab(){
+  const g = new THREE.Group(); g.name = 'Crab'; g.rotation.order = 'YXZ';
+  const mat = enhance(new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: .46, clearcoat: .4, clearcoatRoughness: .35 }), { key: 'crab', caustic: .6, fragHead: GLSL_NOISE,
+    fragColor: `diffuseColor.rgb*=.7+.55*n3(vOPos*42.)*n3(vOPos*95.+5.)*1.6;` });                 // shell mottling
+  // carapace: low rounded shell, wider at the front, with shallow furrows
+  const cg = new THREE.SphereGeometry(1, 30, 20), p = cg.attributes.position, col = [];
+  for (let i = 0; i < p.count; i++){
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    let Y = y * (y > 0 ? .078 : .045);
+    if (y > 0){ Y -= .008 * Math.exp(-((Math.abs(x) - .3) ** 2) * 55) * smooth(-.8, .2, -Math.abs(z)); Y -= .006 * Math.exp(-((z - .12) ** 2) * 45) * (1 - smooth(.25, .6, Math.abs(x))); Y += .004 * Math.sin(x * 9) * Math.sin(z * 7); }
+    p.setXYZ(i, x * .19 * (1 + .13 * z) * (x > 0 ? 1.035 : 1), Y, z * .14 * (1 - .13 * x * x));
+    const n = vnoise3(x * 5 + 3, y * 5, z * 5), top = smooth(-.25, .15, y);
+    const c = mixc([.74, .58, .42], mixc([.36, .09, .045], [.6, .2, .08], n), top), rim = 1 - smooth(0, .3, Math.abs(y)); col.push(c[0] + rim * .1, c[1] + rim * .07, c[2] + rim * .03);
+  }
+  cg.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); cg.computeVertexNormals();
+  const shell = new THREE.Mesh(cg, mat); shell.name = 'Carapace'; g.add(shell);
+  // eyestalks + mouthparts
+  const RED = [.5, .15, .065], DARK = [.22, .07, .04], PALE = [.62, .4, .26];
+  for (const sx of [-1, 1]){
+    const st = new THREE.Group(); st.position.set(sx * .072, .035, .118); st.rotation.set(.35, 0, -sx * .3);
+    const stalk = new THREE.Mesh(paint(new THREE.CylinderGeometry(.007, .01, .04, 6).translate(0, .02, 0), RED), mat);
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(.017, 12, 10), new THREE.MeshPhysicalMaterial({ color: 0x050506, roughness: .05, clearcoat: 1 })); ball.position.y = .048;
+    st.add(stalk, ball); g.add(st); crab.eyes.push(st);
+    const mp = new THREE.Mesh(paint(new THREE.BoxGeometry(.024, .02, .01), PALE), mat); mp.position.set(sx * .015, -.02, .133); mp.rotation.y = sx * .2; g.add(mp);
+  }
+  // eight walking legs: merus + propodus/dactyl, solved with 2-bone IK every frame
+  const upG = paint(new THREE.CylinderGeometry(.012, .019, L1, 7).translate(0, L1 / 2, 0), RED, [.62, .25, .1]);
+  const lowG = mergeGeometries([paint(new THREE.CylinderGeometry(.008, .0125, L2 * .58, 7).translate(0, L2 * .29, 0), [.6, .23, .09], RED),
+    paint(new THREE.ConeGeometry(.008, L2 * .42, 7).translate(0, L2 * .79, 0), DARK), paint(new THREE.SphereGeometry(.0145, 8, 6), [.8, .42, .2])]);
+  const HZ = [.088, .032, -.03, -.086];
+  for (const sx of [-1, 1]) for (let i = 0; i < 4; i++){
+    const up = new THREE.Mesh(upG, mat), low = new THREE.Mesh(lowG, mat); g.add(up, low);
+    const hip = V3(sx * .155, -.014, HZ[i]), home = V3(sx * (.345 + (i === 1 || i === 2 ? .025 : 0)), 0, HZ[i] * 2.15 + (i < 2 ? .015 : -.015));
+    up.position.copy(hip);
+    crab.legs.push({ up, low, hip, home, group: (i + (sx > 0 ? 1 : 0)) % 2, foot: V3(), from: V3(), swing: false });
+  }
+  // two claws on articulated arms; the right one is slightly larger
+  for (const sx of [-1, 1]){
+    const sc = sx > 0 ? 1.22 : 1, sh = new THREE.Group(); sh.position.set(sx * .125, -.008, .1);
+    const d1 = V3(sx * .74, .12, .66).normalize(), merus = new THREE.Mesh(paint(new THREE.CylinderGeometry(.016, .02, .1, 7).translate(0, .05, 0), RED), mat);
+    merus.quaternion.setFromUnitVectors(V3(0, 1, 0), d1);
+    const el = new THREE.Group(); el.position.copy(d1).multiplyScalar(.1);
+    const hand = new THREE.Group(); hand.quaternion.setFromUnitVectors(V3(0, 0, 1), V3(-sx * .5, -.12, .86).normalize()); hand.scale.setScalar(sc);
+    const palm = new THREE.Mesh(paint(new THREE.SphereGeometry(1, 14, 10).scale(.03, .027, .056).translate(0, 0, .05), [.46, .13, .06], [.66, .26, .1]), mat);
+    const fixed = new THREE.Mesh(paint(new THREE.ConeGeometry(.013, .075, 7).rotateX(Math.PI / 2).translate(0, -.012, .128), [.86, .7, .55]), mat);
+    const piv = new THREE.Group(); piv.position.set(0, .012, .092);
+    const mov = new THREE.Mesh(paint(new THREE.ConeGeometry(.011, .07, 7).rotateX(Math.PI / 2).translate(0, 0, .035), [.86, .7, .55]), mat); piv.add(mov);
+    const joint = new THREE.Mesh(paint(new THREE.SphereGeometry(.02, 8, 6), [.8, .42, .2]), mat);
+    hand.add(palm, fixed, piv); el.add(hand, joint); sh.add(merus, el); g.add(sh);
+    crab.claws.push({ sh, el, piv, sx });
+  }
+  crab.g = g; shadowed(g, true, false);
+  crab.pos.y = groundH(crab.pos.x, crab.pos.z) + .088; g.position.copy(crab.pos); g.rotation.y = crab.yaw; g.updateMatrixWorld(true);
+  for (const L of crab.legs){ L.foot.copy(L.home).applyMatrix4(g.matrixWorld); L.foot.y = groundH(L.foot.x, L.foot.z); }
+  return g;
+}
+const bottomDyn = [];                               // moving ground obstacles (snail A registers itself here)
+function groundBlocked(x, z, pad){
+  for (const o of OBST) if (o.ground && Math.hypot(x - o.x, z - o.z) < o.r + pad) return true;
+  for (const o of bottomDyn) if (Math.hypot(x - o.pos.x, z - o.pos.z) < o.r + pad) return true;
+  return false;
+}
+function pickCrabTarget(){
+  const R = crab.R;
+  for (let a = 0; a < 30; a++){
+    let x = lerp(-2.0, 3.3, R()), z = lerp(.3, 1.45, R());
+    if (R() < .25){ x = CASTLE.x + lerp(-.25, .5, R()); z = lerp(.18, .4, R()); }       // wander past the castle entrance
+    if (groundBlocked(x, z, .34) || Math.hypot(x - crab.pos.x, z - crab.pos.z) < .8) continue;
+    crab.target.set(x, 0, z); return;
+  }
+}
+const _cf = V3(), _ck = V3(), _cd = V3(), _cu = V3(), UPY = V3(0, 1, 0);
+function updateCrab(t, dt){
+  const c = crab, g = c.g, p = c.pos;
+  c.sT -= dt;
+  c.stuckT = (c.stuckT || 0) + dt;
+  if (c.stuckT > 3){ if (c.state === 'walk' && Math.hypot(p.x - (c.sx0 ?? p.x), p.z - (c.sz0 ?? p.z)) < .08) pickCrabTarget(); c.stuckT = 0; c.sx0 = p.x; c.sz0 = p.z; }   // never stay wedged
+  if (c.state === 'pause'){ if (c.sT <= 0){ pickCrabTarget(); c.state = 'walk'; c.sT = 30; } }
+  else if (Math.hypot(c.target.x - p.x, c.target.z - p.z) < .12 || c.sT <= 0){ c.state = 'pause'; c.sT = 1.6 + c.R() * 3.4; c.gest = c.R() < .75 ? 1 : 0; c.gestClaw = c.R() < .5 ? 0 : 1; }
+  // desired travel direction with obstacle steering
+  let tx = c.target.x - p.x, tz = c.target.z - p.z; const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+  const steer = (ox, oz, r) => { const dx = p.x - ox, dz = p.z - oz, d = Math.hypot(dx, dz) || 1e-3, pen = (r + .5 - d) / .3;
+    if (pen > 0){ const k = Math.min(pen, 1.3) * 1.3, nx = dx / d, nz = dz / d, sd = (tz * nx - tx * nz) > 0 ? 1 : -1; tx += nx * k - nz * sd * k * .9; tz += nz * k + nx * sd * k * .9; }
+    if (d < r + .3){ p.x = ox + dx / d * (r + .3); p.z = oz + dz / d * (r + .3); } };
+  for (const o of OBST) if (o.ground) steer(o.x, o.z, o.r);
+  for (const o of bottomDyn) steer(o.pos.x, o.pos.z, o.r);
+  const l2 = Math.hypot(tx, tz) || 1; tx /= l2; tz /= l2;
+  // crabs walk sideways: align the body's X axis (either sign) with the travel direction
+  let ya = Math.atan2(-tz, tx), e = ya - c.yaw; e = Math.atan2(Math.sin(e), Math.cos(e)); let sgn = 1;
+  if (Math.abs(e) > Math.PI / 2){ e = Math.atan2(Math.sin(e + Math.PI), Math.cos(e + Math.PI)); sgn = -1; }
+  const walking = c.state === 'walk';
+  c.yawRate += ((walking ? clamp(e * 2, -.9, .9) : 0) - c.yawRate) * Math.min(1, dt * 4); c.yaw += c.yawRate * dt;
+  const want = walking ? .17 * Math.max(0, Math.cos(e)) ** 2 * Math.min(1, tl / .25 + .3) : 0;
+  c.speed += clamp(want - c.speed, -.5 * dt, .3 * dt);
+  c.dir.set(Math.cos(c.yaw) * sgn, 0, -Math.sin(c.yaw) * sgn);
+  p.x = clamp(p.x + c.dir.x * c.speed * dt, -IX + .48, IX - .48); p.z = clamp(p.z + c.dir.z * c.speed * dt, -IZ + .48, IZ - .44);
+  const adv = c.speed * dt + Math.abs(c.yawRate) * .2 * dt; c.gait += adv / (STRIDE * 2);
+  c.move += ((adv > 1e-5 ? 1 : 0) - c.move) * Math.min(1, dt * 5);
+  // body follows the simplified substrate: height + small tilt
+  const h = groundH(p.x, p.z), hx = groundH(p.x + c.dir.z * .15, p.z - c.dir.x * .15) - groundH(p.x - c.dir.z * .15, p.z + c.dir.x * .15), hs = groundH(p.x + c.dir.x * .2, p.z + c.dir.z * .2) - groundH(p.x - c.dir.x * .2, p.z - c.dir.z * .2);
+  p.y = h + .088 + .004 * Math.sin(c.gait * TAU * 2) * c.move + .003 * Math.sin(t * 1.3);
+  g.position.copy(p); g.rotation.set(clamp(hx * 1.6, -.2, .2) * -1, c.yaw, clamp(hs * 2.2 * sgn, -.2, .2)); g.updateMatrixWorld(true);
+  // legs: alternating groups, feet stay planted in world space during stance and step forward during swing
+  for (const L of c.legs){
+    const ph = (c.gait + L.group * .5) % 1, sw = ph < .5;
+    if (sw && !L.swing) L.from.copy(L.foot);
+    L.swing = sw;
+    if (sw){ const k = smooth(0, 1, ph / .5); _cf.copy(L.home).applyMatrix4(g.matrixWorld).addScaledVector(c.dir, STRIDE * .5 * Math.min(1, c.speed / .1));
+      L.foot.lerpVectors(L.from, _cf, k); L.foot.y = groundH(L.foot.x, L.foot.z) + .004 + Math.sin(Math.PI * k) * .05 * c.move; }
+    else L.foot.y += (groundH(L.foot.x, L.foot.z) + .004 - L.foot.y) * Math.min(1, dt * 12);
+    _cf.copy(L.foot); g.worldToLocal(_cf); _cd.copy(_cf).sub(L.hip);
+    let dl = _cd.length(); const dmax = L1 + L2 - .006; if (dl > dmax){ _cd.multiplyScalar(dmax / dl); dl = dmax; _cf.copy(L.hip).add(_cd); }
+    _cd.multiplyScalar(1 / dl);
+    const ca = clamp((L1 * L1 + dl * dl - L2 * L2) / (2 * L1 * dl), -1, 1), sa = Math.sqrt(1 - ca * ca);
+    _cu.copy(UPY).addScaledVector(_cd, -_cd.y).normalize();                                 // knee bends upward
+    _ck.copy(_cd).multiplyScalar(ca * L1).addScaledVector(_cu, sa * L1);                    // hip → knee
+    L.up.quaternion.setFromUnitVectors(UPY, _v1.copy(_ck).normalize());
+    L.low.position.copy(L.hip).add(_ck);
+    L.low.quaternion.setFromUnitVectors(UPY, _v1.copy(_cf).sub(L.low.position).normalize());
+  }
+  // claws: gentle carrying sway while walking, exploratory reach + pincer opening while stopped
+  const gst = c.state === 'pause' ? c.gest * smooth(0, .6, Math.min(c.sT, 2.2)) * smooth(0, .5, 5 - c.sT + 0) : 0;
+  c.claws.forEach((cl, i) => {
+    const act = i === c.gestClaw ? gst : gst * .25;
+    cl.sh.rotation.y = cl.sx * (.06 * Math.sin(t * 1.1 + i * 2) + .05 * Math.sin(c.gait * TAU) * c.move - .35 * act * (.6 + .4 * Math.sin(t * 1.7)));
+    cl.sh.rotation.x = -.25 * act * (.5 + .5 * Math.sin(t * 1.3 + 1));
+    cl.el.rotation.y = cl.sx * (.08 * Math.sin(t * .8 + i) + .3 * act);
+    cl.piv.rotation.x = -(.1 + .08 * Math.sin(t * .9 + i * 3) + .5 * act * (.5 + .5 * Math.sin(t * 3.2)));
+  });
+  c.eyes.forEach((s, i) => { s.rotation.x = .35 + .12 * Math.sin(t * 1.9 + i * 2.1); });
+}
+scene.add(createCrab());
+updaters.push(updateCrab);
+
+/* ============================================================
+   11. STAGE 13 — TWO SNAILS (shared builder, different shells and surface constraints)
+   Snail space: +X = forward, +Y = away from the surface it crawls on (shell side)
+   ============================================================ */
+function shellGeometry(o){                       // logarithmic helico-spiral tube; coil plane XY, spire toward +Z
+  const N = 170, M = 16, turns = 3.2, pos = [], col = [], idx = [];
+  for (let j = 0; j <= N; j++){
+    const th = j / N * turns * TAU, sc = Math.exp(o.b * (th - turns * TAU)), a = th - turns * TAU + .95;
+    const R = o.R * sc, r = o.r * sc, h = o.H * (1 - sc), ca = Math.cos(a), sa = Math.sin(a);
+    for (let i = 0; i < M; i++){ const ph = i / M * TAU, rad = R + r * Math.cos(ph);
+      pos.push(rad * ca, -rad * sa, h + r * 1.08 * Math.sin(ph)); const c = o.color(th, ph, sc); col.push(c[0], c[1], c[2]); }
+  }
+  for (let j = 0; j < N; j++) for (let i = 0; i < M; i++){ const a = j * M + i, b = j * M + (i + 1) % M, c = a + M, d = b + M; idx.push(a, b, c, b, d, c); }
+  const a0 = .95, cc = pos.length / 3; pos.push(o.R * Math.cos(a0) + .012 * Math.sin(a0), -o.R * Math.sin(a0) + .012 * Math.cos(a0), 0); col.push(.1, .07, .05);   // recessed dark aperture
+  for (let i = 0; i < M; i++) idx.push(N * M + i, cc, N * M + (i + 1) % M);
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx); g.computeVertexNormals(); return g;
+}
+function createSnail(o){
+  const g = new THREE.Group(); g.name = o.name;
+  const skin = enhance(new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: .34, clearcoat: .55, clearcoatRoughness: .3 }), { key: 'snail', caustic: .5, fragHead: GLSL_NOISE,
+    fragColor: `diffuseColor.rgb*=.72+.5*n3(vOPos*70.)*n3(vOPos*150.)*1.7;` });
+  const shellM = enhance(new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: .3, clearcoat: .7, clearcoatRoughness: .25, side: THREE.DoubleSide }), { key: 'shell', caustic: .6 });
+  // muscular foot: rounded top, flat pale sole
+  const fg = new THREE.SphereGeometry(1, 22, 9, 0, TAU, 0, Math.PI / 2), fp = fg.attributes.position;
+  for (let i = 0; i < fp.count; i++){ const x = fp.getX(i); fp.setXYZ(i, x * (x < 0 ? .16 : .13), fp.getY(i) * .042 * (1 - .25 * x), fp.getZ(i) * .055 * (1 - .22 * x * x - .12 * x)); }
+  fg.computeVertexNormals(); paint(fg, o.body, [o.body[0] * .65, o.body[1] * .65, o.body[2] * .65]);
+  const sole = new THREE.CircleGeometry(1, 22).rotateX(Math.PI / 2).scale(.145, 1, .052).translate(-.012, .0006, 0); paint(sole, [o.body[0] * 1.5 + .12, o.body[1] * 1.5 + .12, o.body[2] * 1.4 + .1]);
+  const foot = new THREE.Mesh(mergeGeometries([fg, sole]), skin); foot.name = 'Foot'; g.add(foot);
+  // head with two fine tentacles
+  const head = new THREE.Group(); head.position.set(.105, .02, 0);
+  head.add(new THREE.Mesh(paint(new THREE.SphereGeometry(1, 14, 10).scale(.05, .03, .04), o.body), skin));
+  const tents = [];
+  for (const sz of [-1, 1]){ const pv = new THREE.Group(); pv.position.set(.03, .016, sz * .018);
+    pv.add(new THREE.Mesh(paint(new THREE.CylinderGeometry(.0032, .0075, .085, 6).translate(0, .0425, 0), [o.body[0] * .7, o.body[1] * .7, o.body[2] * .7], o.body), skin));
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(.0055, 8, 6), new THREE.MeshStandardMaterial({ color: 0x050505, roughness: .2 })); eye.position.set(.004, .008, sz * .004); pv.add(eye);
+    head.add(pv); tents.push(pv); }
+  g.add(head);
+  // spiral shell seated on the back, spire to the right, slightly tilted
+  const sh = new THREE.Group(); sh.position.set(-.025, o.R + o.r * .55 + .02, .004); sh.rotation.set(-.3, .18, 0);
+  const shell = new THREE.Mesh(shellGeometry(o), shellM); shell.name = 'Shell'; sh.add(shell); g.add(sh);
+  shadowed(g, true, false); g.scale.setScalar(o.scale || 1);
+  return { g, foot, head, tents, sh, ph: o.ph || 0 };
+}
+function animateSnailParts(S, t, moving, retract){
+  const w = t * 1.5 + S.ph;
+  S.foot.scale.set(1 + .05 * Math.sin(w) * moving, 1 + .04 * Math.sin(w + 1.5) * moving, 1 - .03 * Math.sin(w) * moving);     // peristaltic stretch/squash
+  S.head.position.x = .105 + .012 * Math.sin(w - 1) * moving - .03 * retract; S.head.rotation.y = .22 * Math.sin(t * .43 + S.ph * 2); S.head.rotation.z = .1 * Math.sin(t * .31 + S.ph);
+  S.sh.rotation.z = .045 * Math.sin(w + .8) * moving; S.sh.position.x = -.025 - .008 * Math.sin(w) * moving;                    // shell rides the body
+  S.tents.forEach((p, i) => { const s = i ? 1 : -1; p.rotation.z = -1.0 + .22 * Math.sin(t * .9 + i * 1.7 + S.ph) + .5 * retract; p.rotation.x = s * (.38 + .2 * Math.sin(t * .63 + i * 2.3 + S.ph));
+    p.scale.y = 1 - .55 * retract + .08 * Math.sin(t * 1.3 + i); });
+}
+// --- Snail A: bottom crawler (amber-brown, growth bands) ---
+const snailA = createSnail({ name: 'Snail_Bottom', R: .05, r: .046, H: .062, b: .125, scale: 1.05, ph: 0, body: [.4, .33, .24],
+  color: (th, ph, sc) => { const band = .5 + .5 * Math.sin(th * 15 + Math.sin(ph) * .6), fine = .5 + .5 * Math.sin(th * 61);
+    return mixc(mixc([.80, .52, .16], [.40, .2, .07], band * .8 + fine * .15), [.9, .75, .45], (1 - sc) * .35); } });
+Object.assign(snailA, { pos: V3(.35, 0, 1.52), heading: .1, wp: 0, v: 0, r: .2, retract: 0,
+  route: [[1.05, 1.42], [1.75, 1.56], [2.45, 1.3], [2.95, 1.58], [2.05, 1.28], [1.05, 1.42], [.2, 1.56], [-.65, 1.48]] });
+bottomDyn.push(snailA);
+const _sn = V3(), _sf = V3(), _sr = V3(), _sq = new THREE.Quaternion();
+function updateSnailA(t, dt){
+  const S = snailA, p = S.pos, w = S.route[S.wp], dx = w[0] - p.x, dz = w[1] - p.z;
+  if (Math.hypot(dx, dz) < .07) S.wp = (S.wp + 1) % S.route.length;
+  const near = Math.hypot(crab.pos.x - p.x, crab.pos.z - p.z) < .62;                         // yields to the crab: stops and pulls its head in
+  S.retract += ((near ? 1 : 0) - S.retract) * Math.min(1, dt * 1.5);
+  let e = Math.atan2(-dz, dx) - S.heading; e = Math.atan2(Math.sin(e), Math.cos(e));
+  S.heading += clamp(e, -.3 * dt, .3 * dt);
+  S.v += ((near ? 0 : .03 * (1 - .5 * Math.min(1, Math.abs(e)))) - S.v) * Math.min(1, dt * 1.2);
+  const pulse = 1 + .35 * Math.sin(t * 1.5);                                                 // crawling in gentle surges
+  p.x = clamp(p.x + Math.cos(S.heading) * S.v * pulse * dt, -IX + .2, IX - .2); p.z = clamp(p.z - Math.sin(S.heading) * S.v * pulse * dt, -IZ + .2, IZ - .19);
+  const e2 = .07, h = groundH(p.x, p.z);
+  _sn.set(groundH(p.x - e2, p.z) - groundH(p.x + e2, p.z), 2 * e2, groundH(p.x, p.z - e2) - groundH(p.x, p.z + e2)).normalize();     // surface normal
+  _sf.set(Math.cos(S.heading), 0, -Math.sin(S.heading)); _sf.addScaledVector(_sn, -_sf.dot(_sn)).normalize(); _sr.crossVectors(_sf, _sn);
+  _sq.setFromRotationMatrix(_m1.makeBasis(_sf, _sn, _sr)); S.g.quaternion.slerp(_sq, Math.min(1, dt * 2.5));
+  p.y = h + .003; S.g.position.copy(p);
+  animateSnailParts(S, t, S.v / .03, S.retract);
+}
+// --- Snail B: glass crawler (cream/olive shell with dark spiral stripes) on the inside of the front pane ---
+const snailB = createSnail({ name: 'Snail_Glass', R: .046, r: .043, H: .075, b: .135, scale: .95, ph: 2.4, body: [.3, .31, .24],
+  color: (th, ph, sc) => { const st = smooth(.35, .6, .5 + .5 * Math.sin(ph * 3 + 1.2)), spk = hash2(Math.floor(th * 9), Math.floor(ph * 2.5)) > .8 ? .5 : 0;
+    return mixc(mixc([.82, .8, .52], [.55, .58, .3], .5 + .5 * Math.sin(th * 7)), [.15, .12, .05], Math.max(st * .85, spk)); } });
+Object.assign(snailB, { x: -3.22, y: 1.02, a: .95, v: 0, leg: 1, ends: [[-3.3, .92], [-2.82, 1.5]] });
+const GLASS_Z = WZ - .0035;                       // foot sole rests on the inner face of the front pane
+function updateSnailB(t, dt){
+  const S = snailB, w = S.ends[S.leg], dx = w[0] - S.x, dy = w[1] - S.y;
+  if (Math.hypot(dx, dy) < .05) S.leg = 1 - S.leg;
+  let e = Math.atan2(dy, dx) - S.a; e = Math.atan2(Math.sin(e), Math.cos(e));
+  S.a += clamp(e, -.16 * dt, .16 * dt);
+  S.v += (.012 * (1 - .4 * Math.min(1, Math.abs(e))) - S.v) * Math.min(1, dt);
+  const pulse = 1 + .4 * Math.sin(t * 1.2 + 1);
+  S.x = clamp(S.x + Math.cos(S.a) * S.v * pulse * dt, -IX + .25, IX - .25); S.y = clamp(S.y + Math.sin(S.a) * S.v * pulse * dt, .8, WL / 3 + .05);   // lower third, always under water
+  _sf.set(Math.cos(S.a), Math.sin(S.a), 0); _sn.set(0, 0, -1); _sr.crossVectors(_sf, _sn);
+  S.g.quaternion.setFromRotationMatrix(_m1.makeBasis(_sf, _sn, _sr)); S.g.position.set(S.x, S.y, GLASS_Z);
+  animateSnailParts(S, t, 1, 0);
+}
+scene.add(snailA.g, snailB.g);
+updaters.push(updateSnailA, updateSnailB);
+
+/* ============================================================
+   12. STAGE 14 — SUSPENDED PARTICLES (drift with the shared current)
+   ============================================================ */
+const PART_N = 110, partPos = new Float32Array(PART_N * 3), partUni = { uPx: { value: 600 } };
+function createParticles(){
+  const g = new THREE.BufferGeometry(), sz = new Float32Array(PART_N);
+  for (let i = 0; i < PART_N; i++){ partPos[i * 3] = rr(-IX + .1, IX - .1); partPos[i * 3 + 1] = rr(.7, WL - .15); partPos[i * 3 + 2] = rr(-IZ + .1, IZ - .1); sz[i] = rr(.012, .03); }
+  g.setAttribute('position', new THREE.BufferAttribute(partPos, 3).setUsage(THREE.DynamicDrawUsage)); g.setAttribute('aS', new THREE.BufferAttribute(sz, 1));
+  const m = new THREE.Points(g, new THREE.ShaderMaterial({ transparent: true, depthWrite: false, uniforms: partUni,
+    vertexShader: `uniform float uPx;attribute float aS;void main(){vec4 mv=modelViewMatrix*vec4(position,1.);gl_PointSize=max(aS*uPx/-mv.z,1.);gl_Position=projectionMatrix*mv;}`,
+    fragmentShader: `void main(){float d=length(gl_PointCoord-.5);gl_FragColor=vec4(vec3(.82,.93,.9),(1.-smoothstep(.08,.5,d))*.26);
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+    }` }));
+  m.name = 'SuspendedParticles'; m.frustumCulled = false; return m;
+}
+const particles = createParticles(); scene.add(particles);
+updaters.push((t, dt) => {
+  for (let i = 0; i < PART_N; i++){
+    const o = i * 3, c = currentAt(partPos[o], partPos[o + 1], partPos[o + 2], t, _v1);
+    partPos[o] += c.x * .05 * dt; partPos[o + 1] += (c.y * .05 - .004) * dt; partPos[o + 2] += c.z * .05 * dt;
+    if (Math.abs(partPos[o]) > IX - .08 || Math.abs(partPos[o + 2]) > IZ - .08 || partPos[o + 1] > WL - .1 || partPos[o + 1] < bedH(partPos[o], partPos[o + 2]) + .05){
+      partPos[o] = rr(-IX + .15, IX - .15); partPos[o + 1] = rr(.8, WL - .2); partPos[o + 2] = rr(-IZ + .15, IZ - .15); }
+  }
+  particles.geometry.attributes.position.needsUpdate = true;
+});
+
+
+/* ============================================================
+   99. STAGE 15/16 — PRESENTATION, RENDER PASSES, MAIN LOOP
+   ============================================================ */
+let paused = false, simT = 0, lastNow = performance.now();
+let dprCap = 2, ftAcc = 0, ftN = 0;                                        // adaptive quality: optical resolution drops before any feature does
+const _db = new THREE.Vector2();
+function resize(){
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
+  renderer.setSize(w, h);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  renderer.getDrawingBufferSize(_db);
+  const sc = Math.min(1, Math.sqrt(3.4e6 / (_db.x * _db.y)));            // cap the optical render target
+  sceneRT.setSize(Math.max(2, Math.round(_db.x * sc)), Math.max(2, Math.round(_db.y * sc)));
+  waterUni.uRes.value.copy(_db);
+  controls.maxDistance = fitDistance() * 1.7;
+  partUni.uPx.value = _db.y * .5 / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+}
+function render(){
+  renderer.shadowMap.needsUpdate = true;
+  // pass 1: everything except the water interfaces and glass → colour + depth for refraction (no feedback possible)
+  camera.layers.set(0);
+  renderer.setRenderTarget(sceneRT); renderer.render(scene, camera);
+  // pass 2: final image; water interfaces resolve refraction from pass 1, glass is composited last
+  renderer.setRenderTarget(null);
+  camera.layers.enable(L_WATER); camera.layers.enable(L_GLASS); camera.layers.enable(L_EXT);
+  renderer.render(scene, camera);
+}
+function frame(now){
+  requestAnimationFrame(frame);
+  const raw = (now - lastNow) / 1000, dt = Math.min(raw, 0.05); lastNow = now;      // clamp after hidden-tab resume
+  if (raw < .25){ ftAcc += raw; if (++ftN >= 90){ if (ftAcc / ftN > 1 / 38 && dprCap > 1){ dprCap = Math.max(1, dprCap - .25); resize(); } ftAcc = 0; ftN = 0; } }
+  controls.update(); constrainCamera();
+  if (!paused){ simT += dt; shared.uTime.value = simT; for (const u of updaters) u(simT, dt); }
+  render();
+}
+const btnPause = document.getElementById('btnPause');
+btnPause.addEventListener('click', () => { paused = !paused; btnPause.textContent = paused ? 'Resume' : 'Pause'; });
+document.getElementById('btnReset').addEventListener('click', resetView);
+window.addEventListener('resize', resize);
+resize(); resetView();
+for (let i = 0; i < 240; i++){ simT += 1 / 30; for (const u of updaters) u(simT, 1 / 30); }   // pre-roll so the scene opens already alive
+shared.uTime.value = simT;
+requestAnimationFrame(frame);
+
+</script>
+</body>
+</html>

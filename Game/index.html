@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#101923">
+<title>DEEPWAKE</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23101923'/%3E%3Crect x='3' y='3' width='10' height='7' fill='%23dcd7cb'/%3E%3Crect x='4' y='4' width='8' height='5' fill='%2305080b'/%3E%3Crect x='8' y='5' width='3' height='3' fill='%23ffb648'/%3E%3Crect x='6' y='11' width='4' height='3' fill='%237fe3ee'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./style.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<canvas id="scene" aria-label="DEEPWAKE game view"></canvas>
+
+<div id="hud" class="hidden" aria-live="off">
+  <div class="hud-left">
+    <div class="hud-row" title="Integrity">
+      <span class="hud-label">Integrity</span>
+      <div id="integrity" class="integrity" role="img" aria-label="Integrity 3 of 3">
+        <i></i><i></i><i></i>
+      </div>
+    </div>
+    <div class="hud-row" title="Resonance energy. Pulse costs 35, shield costs 50.">
+      <span class="hud-label">Resonance</span>
+      <div id="energy" class="energy" role="img" aria-label="Resonance 100 of 100">
+        <div id="energyFill" class="energy-fill"></div>
+        <span class="tick tick-pulse" title="Echo Pulse: 35"><b>Pulse 35</b></span>
+        <span class="tick tick-shield" title="Emergency Shield: 50"><b>Shield 50</b></span>
+      </div>
+      <span id="energyNum" class="hud-num">100</span>
+    </div>
+    <div class="hud-row">
+      <span class="hud-label">Relays</span>
+      <div id="relays" class="relays" role="img" aria-label="Relays: A offline, B offline, C offline">
+        <i data-id="A">A</i><i data-id="B">B</i><i data-id="C">C</i>
+      </div>
+      <span class="hud-label hud-gap">Archives</span>
+      <span id="archives" class="hud-num">0 / 3</span>
+      <span id="carry" class="carry hidden" title="Carrying a power cell: dash, pulse and wall moves are unavailable">
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="5" y="1" width="6" height="2" fill="currentColor"/><rect x="3" y="3" width="10" height="12" fill="currentColor"/><rect x="5" y="6" width="6" height="2" fill="#101923"/><rect x="5" y="10" width="6" height="2" fill="#101923"/></svg>
+        Cell
+      </span>
+    </div>
+    <div id="abilities" class="abilities" aria-hidden="true">
+      <span id="abDash" class="ab">Dash</span>
+      <span id="abPulse" class="ab">Pulse</span>
+      <span id="abShield" class="ab">Shield</span>
+    </div>
+  </div>
+  <div class="hud-right">
+    <span id="clock" class="clock" title="Active expedition time">0:00.0</span>
+    <button id="btnMute" class="icon-btn" type="button" aria-label="Mute sound" aria-pressed="false">
+      <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path class="waves" d="M11 5.5c1.2 1.4 1.2 3.6 0 5M12.8 3.8c2.2 2.4 2.2 6 0 8.4" stroke="currentColor" fill="none" stroke-width="1.3"/><path class="cross" d="M11 6l4 4M15 6l-4 4" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+    <button id="btnPause" class="icon-btn" type="button" aria-label="Pause">
+      <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><rect x="3" y="2" width="4" height="12" fill="currentColor"/><rect x="9" y="2" width="4" height="12" fill="currentColor"/></svg>
+    </button>
+  </div>
+</div>
+
+<div id="region" class="region" aria-live="polite"></div>
+<div id="hint" class="hint hidden" aria-live="polite"></div>
+<div id="prompt" class="prompt hidden" aria-live="polite"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="banner" class="banner hidden" role="status">Rebooting at Station</div>
+
+<div id="archivePanel" class="archive-panel hidden" role="dialog" aria-labelledby="archiveTitle">
+  <div class="archive-kicker">Memory Archive</div>
+  <h3 id="archiveTitle"></h3>
+  <p id="archiveText"></p>
+  <button id="archiveDismiss" type="button" class="btn small">Dismiss</button>
+</div>
+
+<div id="touch" class="touch hidden" aria-hidden="true">
+  <div class="touch-left">
+    <button type="button" data-act="left" aria-label="Move left">◀</button>
+    <button type="button" data-act="right" aria-label="Move right">▶</button>
+  </div>
+  <div class="touch-right">
+    <button type="button" data-act="pulse" class="t-small" aria-label="Echo pulse">Pulse</button>
+    <button type="button" data-act="interact" class="t-small" aria-label="Interact">Use</button>
+    <button type="button" data-act="dash" aria-label="Dash">Dash</button>
+    <button type="button" data-act="jump" class="t-big" aria-label="Jump">Jump</button>
+  </div>
+</div>
+
+<div id="overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="ovTitle">
+  <div class="panel" id="panel">
+    <!-- Title -->
+    <section id="ovTitleScreen" class="screen">
+      <h1 id="ovTitle" class="logo">DEEPWAKE</h1>
+      <p class="lead">Wake ILO beneath the buried station.<br>Restore three resonance relays and reach the ascent lift.</p>
+      <button id="btnBegin" type="button" class="btn primary">Begin Expedition</button>
+      <div id="titleRecords" class="records"></div>
+      <details class="controls">
+        <summary>Controls</summary>
+        <table>
+          <tr><th>A / D or ← / →</th><td>Move</td></tr>
+          <tr><th>Space or Z</th><td>Jump — hold for height; kick away from a wall</td></tr>
+          <tr><th>Shift or X</th><td>Dash</td></tr>
+          <tr><th>Q</th><td>Echo pulse</td></tr>
+          <tr><th>E</th><td>Interact / carry a power cell</td></tr>
+          <tr><th>R</th><td>Retry from the last checkpoint</td></tr>
+          <tr><th>P or Esc</th><td>Pause</td></tr>
+        </table>
+      </details>
+    </section>
+
+    <!-- Pause -->
+    <section id="ovPause" class="screen hidden">
+      <h2>Expedition Paused</h2>
+      <div class="btn-col">
+        <button id="btnResume" type="button" class="btn primary">Resume</button>
+        <button id="btnRetry" type="button" class="btn">Retry from Checkpoint</button>
+        <button id="btnRestart" type="button" class="btn danger">Restart Expedition</button>
+      </div>
+      <p id="restartConfirm" class="confirm hidden">Restart clears all relays, discoveries and checkpoints of this run. Records and settings are kept.
+        <span class="btn-row"><button id="btnRestartYes" type="button" class="btn danger small">Restart Now</button>
+        <button id="btnRestartNo" type="button" class="btn small">Cancel</button></span></p>
+      <div class="toggles">
+        <label><input id="optMute" type="checkbox"> Mute sound</label>
+        <label><input id="optMotion" type="checkbox"> Reduced motion</label>
+      </div>
+      <div class="archives-list">
+        <h3>Memory Archives <span id="pauseArchiveCount">0 / 3</span></h3>
+        <div id="pauseArchives"></div>
+      </div>
+      <details class="controls">
+        <summary>Controls</summary>
+        <table>
+          <tr><th>A / D or ← / →</th><td>Move</td></tr>
+          <tr><th>Space or Z</th><td>Jump — hold for height; kick away from a wall</td></tr>
+          <tr><th>Shift or X</th><td>Dash</td></tr>
+          <tr><th>Q</th><td>Echo pulse (35 resonance)</td></tr>
+          <tr><th>E</th><td>Interact / carry a power cell</td></tr>
+          <tr><th>R</th><td>Retry from the last checkpoint</td></tr>
+          <tr><th>P or Esc</th><td>Pause / resume</td></tr>
+        </table>
+      </details>
+    </section>
+
+    <!-- Complete -->
+    <section id="ovComplete" class="screen hidden">
+      <h2 id="completeTitle">Signal Restored</h2>
+      <p id="completeKind" class="lead"></p>
+      <table class="results" id="resultsTable"></table>
+      <div id="completeRecords" class="records"></div>
+      <button id="btnNew" type="button" class="btn primary">New Expedition</button>
+    </section>
+
+    <!-- Fallback -->
+    <section id="ovError" class="screen hidden">
+      <h2>DEEPWAKE cannot start</h2>
+      <p id="errorText" class="lead">WebGL is unavailable in this browser.</p>
+    </section>
+  </div>
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
